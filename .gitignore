@@ -7,4 +7,8 @@ data/main.db-shm
 data/main.db-wal
 logs/
 __pycache__/
-*.pyc
+*.pyc-e 
+
+# Экспорт результатов (генерируется автоматически)
+results/*.xlsx
+results/*.csv
