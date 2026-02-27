@@ -2,12 +2,7 @@
 .env
 
 # Python cache
-__pycache__\
+data/main.db
+logs/
+__pycache__/
 *.pyc
-*.pyo
-
-# База данных
-data\main.db
-
-# Логи
-logs\
