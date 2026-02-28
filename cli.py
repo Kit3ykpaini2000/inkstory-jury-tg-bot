@@ -1088,21 +1088,25 @@ def main():
         show_stats, manage_reviewers, manage_posts,
         manage_days, manage_links, view_logs, full_reset,
     ]
-    while True:
-        choice = menu("Главное меню", [
-            "📊 Статистика",
-            "👥 Управление жюри",
-            "📝 Управление постами",
-            "📅 Управление днями",
-            "🔗 Управление ссылками",
-            "📄 Просмотр логов",
-            "🗑  Полная очистка данных",
-        ], show_stats=True)
-        if choice == -1:
-            clr()
-            print(f"{DIM}Выход.{RESET}\n")
-            break
-        actions[choice]()
+    try:
+        while True:
+            choice = menu("Главное меню", [
+                "📊 Статистика",
+                "👥 Управление жюри",
+                "📝 Управление постами",
+                "📅 Управление днями",
+                "🔗 Управление ссылками",
+                "📄 Просмотр логов",
+                "🗑  Полная очистка данных",
+            ], show_stats=True)
+            if choice == -1:
+                break
+            actions[choice]()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        clr()
+        print(f"{DIM}Выход.{RESET}\n")
 
 
 if __name__ == "__main__":
