@@ -1,56 +1,271 @@
-import sys as _sys
-import pathlib as _pathlib
-_ROOT = _pathlib.Path(__file__).parent.parent
-if str(_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_ROOT))
-
 """
-migrate.py — перенос данных из старой БД (v6, с queue_{TGID}) в новую (v7, единая queue)
+migrate.py — миграция данных из старой БД в новую схему
 
 Запуск: python scripts/migrate.py --old path/to/old.db --new path/to/new.db
 
 Что переносится:
-- reviewers  : TGID, URL, Name, IsAdmin, Verified
-- authors    : ID, Name, URL
-- days       : Day, Data
-- links      : URL, Parsed
-- blacklist  : URL
-- posts_info : ID, Author, URL, Text, Day, HumanChecked, PostOfReviewer, Rejected
-- queue      : переносим из всех таблиц queue_{TGID} в единую queue(Reviewer, Post)
-- results    : ID, Post, BotWords, HumanWords, HumanErrors, Reviewer, SkipReason, RejectReason
+  reviewers  — без изменений
+  authors    — без изменений
+  days       — без изменений
+  links      — без изменений
+  blacklist  — без изменений
+  posts_info — HumanChecked/Rejected/PostOfReviewer → Status
+  results    — без Reviewer/SkipReason (они теперь в queue)
+  queue      — добавляем AssignedAt/TakenAt, поддержка старых queue_{TGID}
+
+Что НЕ переносится:
+  - Посты у которых results.Reviewer IS NOT NULL но HumanWords IS NULL
+    (жюри взял но не проверил) — сбрасываются в pending
 """
 
-import sqlite3
-import argparse
-import pathlib
 import sys
 import re
+import argparse
+import pathlib
+import sqlite3
+from datetime import datetime, timezone
 
 
-def get_conn(path: str) -> sqlite3.Connection:
+def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=OFF")  # отключаем на время миграции
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def _post_status(human_checked: int, rejected: int, post_of_reviewer: int) -> str:
+    """Конвертирует три старых булевых поля в новый Status."""
+    if post_of_reviewer:
+        return "reviewer_post"
+    if rejected:
+        return "rejected"
+    if human_checked:
+        return "done"
+    return "pending"
+
+
+# ── Таблицы без изменений ─────────────────────────────────────────────────────
+
+def migrate_reviewers(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    rows = old.execute(
+        "SELECT TGID, URL, Name, IsAdmin, Verified FROM reviewers"
+    ).fetchall()
+    new.executemany(
+        "INSERT OR IGNORE INTO reviewers (TGID, URL, Name, IsAdmin, Verified) VALUES (?,?,?,?,?)",
+        [(r["TGID"], r["URL"], r["Name"], r["IsAdmin"] or 0, r["Verified"] or 0) for r in rows],
+    )
+    new.commit()
+    return len(rows)
+
+
+def migrate_authors(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    rows = old.execute("SELECT ID, Name, URL FROM authors").fetchall()
+    new.executemany(
+        "INSERT OR IGNORE INTO authors (ID, Name, URL) VALUES (?,?,?)",
+        [(r["ID"], r["Name"], r["URL"]) for r in rows],
+    )
+    new.commit()
+    return len(rows)
+
+
+def migrate_days(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    rows = old.execute("SELECT Day, Data FROM days").fetchall()
+    new.executemany(
+        "INSERT OR IGNORE INTO days (Day, Data) VALUES (?,?)",
+        [(r["Day"], r["Data"]) for r in rows],
+    )
+    new.commit()
+    return len(rows)
+
+
+def migrate_links(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    rows = old.execute("SELECT URL, Parsed FROM links").fetchall()
+    new.executemany(
+        "INSERT OR IGNORE INTO links (URL, Parsed) VALUES (?,?)",
+        [(r["URL"], r["Parsed"] or 0) for r in rows],
+    )
+    new.commit()
+    return len(rows)
+
+
+def migrate_blacklist(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    rows = old.execute("SELECT URL FROM blacklist").fetchall()
+    new.executemany(
+        "INSERT OR IGNORE INTO blacklist (URL) VALUES (?)",
+        [(r["URL"],) for r in rows],
+    )
+    new.commit()
+    return len(rows)
+
+
+# ── posts_info — конвертируем статусы ─────────────────────────────────────────
+
+def migrate_posts(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    # Проверяем какие колонки есть в старой таблице
+    cols = {row[1] for row in old.execute("PRAGMA table_info(posts_info)").fetchall()}
+
+    rows = old.execute("SELECT * FROM posts_info").fetchall()
+    inserted = 0
+
+    for r in rows:
+        human_checked   = r["HumanChecked"]   if "HumanChecked"   in cols else 0
+        rejected        = r["Rejected"]        if "Rejected"        in cols else 0
+        post_of_reviewer= r["PostOfReviewer"]  if "PostOfReviewer"  in cols else 0
+        status = _post_status(
+            human_checked or 0,
+            rejected or 0,
+            post_of_reviewer or 0,
+        )
+
+        new.execute(
+            """
+            INSERT OR IGNORE INTO posts_info (ID, Author, URL, Text, Day, Status)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (r["ID"], r["Author"], r["URL"], r["Text"], r["Day"], status),
+        )
+        inserted += 1
+
+    new.commit()
+    return inserted
+
+
+# ── results — убираем Reviewer/SkipReason ────────────────────────────────────
+
+def migrate_results(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    cols = {row[1] for row in old.execute("PRAGMA table_info(results)").fetchall()}
+    rows = old.execute("SELECT * FROM results").fetchall()
+    inserted = 0
+
+    for r in rows:
+        # Пропускаем посты-жюри
+        post_status = new.execute(
+            "SELECT Status FROM posts_info WHERE ID=?", (r["Post"],)
+        ).fetchone()
+        if post_status and post_status["Status"] == "reviewer_post":
+            continue
+
+        # Берём reviewer из старой таблицы только если проверка завершена
+        reviewer = None
+        if "Reviewer" in cols and r["HumanWords"] is not None:
+            reviewer = r["Reviewer"]
+
+        new.execute(
+            """
+            INSERT OR IGNORE INTO results
+                (ID, Post, BotWords, HumanWords, HumanErrors, RejectReason, Reviewer)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                r["ID"], r["Post"], r["BotWords"],
+                r["HumanWords"], r["HumanErrors"],
+                r["RejectReason"] if "RejectReason" in cols else None,
+                reviewer,
+            ),
+        )
+        inserted += 1
+
+    new.commit()
+    return inserted
+
+
+# ── queue — поддержка и старой и новой схемы ──────────────────────────────────
+
+def migrate_queue(old: sqlite3.Connection, new: sqlite3.Connection) -> int:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    inserted = 0
+
+    # Проверяем новую единую таблицу queue
+    old_tables = {
+        row["name"]
+        for row in old.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+
+    if "queue" in old_tables:
+        cols = {row[1] for row in old.execute("PRAGMA table_info(queue)").fetchall()}
+
+        if "Reviewer" in cols:
+            # Новая схема (Reviewer, Post) — просто переносим
+            rows = old.execute(
+                """
+                SELECT q.Post, q.Reviewer
+                FROM queue q
+                JOIN posts_info p ON q.Post = p.ID
+                WHERE p.Rejected = 0 AND p.HumanChecked = 0
+                """
+            ).fetchall() if "HumanChecked" in {
+                row[1] for row in old.execute("PRAGMA table_info(posts_info)").fetchall()
+            } else old.execute("SELECT Post, Reviewer FROM queue").fetchall()
+
+            for r in rows:
+                # Проверяем что пост существует в новой БД и ещё pending
+                status = new.execute(
+                    "SELECT Status FROM posts_info WHERE ID=?", (r["Post"],)
+                ).fetchone()
+                if not status or status["Status"] not in ("pending", "checking"):
+                    continue
+                new.execute(
+                    "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?,?,?)",
+                    (r["Post"], r["Reviewer"], now),
+                )
+                inserted += 1
+        else:
+            # Совсем старая схема без Reviewer — пропускаем
+            print("  queue: старая схема без Reviewer — пропускаем")
+
+    # Ищем персональные таблицы queue_{TGID} (очень старая схема)
+    for table_name in old_tables:
+        match = re.match(r"^queue_(\d+)$", table_name)
+        if not match:
+            continue
+        tgid = match.group(1)
+        rows = old.execute(f"SELECT Post FROM [{table_name}]").fetchall()  # noqa: S608
+        for r in rows:
+            status = new.execute(
+                "SELECT Status FROM posts_info WHERE ID=?", (r["Post"],)
+            ).fetchone()
+            if not status or status["Status"] not in ("pending", "checking"):
+                continue
+            new.execute(
+                "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?,?,?)",
+                (r["Post"], tgid, now),
+            )
+            inserted += 1
+        if rows:
+            print(f"  {table_name} → queue: {len(rows)} записей")
+
+    new.commit()
+    return inserted
+
+
+# ── Основная функция ──────────────────────────────────────────────────────────
 
 def migrate(old_path: str, new_path: str) -> None:
     print(f"Старая БД : {old_path}")
     print(f"Новая БД  : {new_path}")
     print()
 
-    old = get_conn(old_path)
-    new = get_conn(new_path)
+    old = connect(old_path)
+    new = connect(new_path)
+
+    steps = [
+        ("reviewers",  migrate_reviewers),
+        ("authors",    migrate_authors),
+        ("days",       migrate_days),
+        ("links",      migrate_links),
+        ("blacklist",  migrate_blacklist),
+        ("posts_info", migrate_posts),
+        ("results",    migrate_results),
+        ("queue",      migrate_queue),
+    ]
 
     try:
-        _migrate_reviewers(old, new)
-        _migrate_authors(old, new)
-        _migrate_days(old, new)
-        _migrate_links(old, new)
-        _migrate_blacklist(old, new)
-        _migrate_posts(old, new)
-        _migrate_queue(old, new)
-        _migrate_results(old, new)
+        for name, fn in steps:
+            count = fn(old, new)
+            print(f"  {name:<15} {count} записей")
         print("\n✅ Миграция завершена успешно.")
     except Exception as e:
         print(f"\n❌ Ошибка миграции: {e}")
@@ -60,189 +275,12 @@ def migrate(old_path: str, new_path: str) -> None:
         new.close()
 
 
-# ── Таблицы ───────────────────────────────────────────────────────────────────
-
-def _migrate_reviewers(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute("SELECT TGID, URL, Name, IsAdmin, Verified FROM reviewers").fetchall()
-    new.executemany(
-        "INSERT OR IGNORE INTO reviewers (TGID, URL, Name, IsAdmin, Verified) VALUES (?, ?, ?, ?, ?)",
-        [(r["TGID"], r["URL"], r["Name"], r["IsAdmin"], r["Verified"]) for r in rows],
-    )
-    new.commit()
-    print(f"reviewers  : {len(rows)} записей")
-
-
-def _migrate_authors(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute("SELECT ID, Name, URL FROM authors").fetchall()
-    new.executemany(
-        "INSERT OR IGNORE INTO authors (ID, Name, URL) VALUES (?, ?, ?)",
-        [(r["ID"], r["Name"], r["URL"]) for r in rows],
-    )
-    new.commit()
-    print(f"authors    : {len(rows)} записей")
-
-
-def _migrate_days(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute("SELECT Day, Data FROM days").fetchall()
-    new.executemany(
-        "INSERT OR IGNORE INTO days (Day, Data) VALUES (?, ?)",
-        [(r["Day"], r["Data"]) for r in rows],
-    )
-    new.commit()
-    print(f"days       : {len(rows)} записей")
-
-
-def _migrate_links(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute("SELECT URL, Parsed FROM links").fetchall()
-    new.executemany(
-        "INSERT OR IGNORE INTO links (URL, Parsed) VALUES (?, ?)",
-        [(r["URL"], r["Parsed"]) for r in rows],
-    )
-    new.commit()
-    print(f"links      : {len(rows)} записей")
-
-
-def _migrate_blacklist(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute("SELECT URL FROM blacklist").fetchall()
-    new.executemany(
-        "INSERT OR IGNORE INTO blacklist (URL) VALUES (?)",
-        [(r["URL"],) for r in rows],
-    )
-    new.commit()
-    print(f"blacklist  : {len(rows)} записей")
-
-
-def _migrate_posts(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    rows = old.execute(
-        """
-        SELECT ID, Author, URL, Text, Day,
-               HumanChecked, PostOfReviewer, Rejected
-        FROM posts_info
-        """
-    ).fetchall()
-    new.executemany(
-        """
-        INSERT OR IGNORE INTO posts_info
-            (ID, Author, URL, Text, Day, HumanChecked, PostOfReviewer, Rejected)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                r["ID"], r["Author"], r["URL"], r["Text"], r["Day"],
-                r["HumanChecked"], r["PostOfReviewer"], r["Rejected"],
-            )
-            for r in rows
-        ],
-    )
-    new.commit()
-    print(f"posts_info : {len(rows)} записей")
-
-
-def _migrate_queue(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    """
-    Переносит данные из персональных таблиц queue_{TGID} (старая схема)
-    в единую таблицу queue(Reviewer, Post) (новая схема).
-    """
-    # Создаём новую таблицу если нет
-    new.execute(
-        """
-        CREATE TABLE IF NOT EXISTS queue (
-            Reviewer TEXT    NOT NULL,
-            Post     INTEGER NOT NULL,
-            PRIMARY KEY (Reviewer, Post),
-            FOREIGN KEY (Reviewer) REFERENCES reviewers(TGID),
-            FOREIGN KEY (Post)     REFERENCES posts_info(ID)
-        )
-        """
-    )
-    new.execute("CREATE INDEX IF NOT EXISTS idx_queue_reviewer ON queue(Reviewer)")
-    new.execute("CREATE INDEX IF NOT EXISTS idx_queue_post     ON queue(Post)")
-    new.commit()
-
-    # Ищем все таблицы вида queue_{TGID} в старой БД
-    tables = old.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'queue_%'"
-    ).fetchall()
-
-    total = 0
-    for table_row in tables:
-        table_name = table_row["name"]
-        # Извлекаем TGID из имени таблицы
-        match = re.match(r"^queue_(\d+)$", table_name)
-        if not match:
-            print(f"  Пропускаем таблицу {table_name} (не похожа на queue_{{TGID}})")
-            continue
-
-        tgid = match.group(1)
-        rows = old.execute(f"SELECT Post FROM {table_name}").fetchall()  # noqa: S608
-
-        if rows:
-            new.executemany(
-                "INSERT OR IGNORE INTO queue (Reviewer, Post) VALUES (?, ?)",
-                [(tgid, r["Post"]) for r in rows],
-            )
-            new.commit()
-            print(f"  {table_name} → queue (reviewer={tgid}): {len(rows)} записей")
-            total += len(rows)
-
-    if not tables:
-        # Старая БД уже может иметь единую queue без TGID (совсем старые версии)
-        try:
-            rows = old.execute("SELECT Post FROM queue").fetchall()
-            print(f"  Старая единая queue без Reviewer: {len(rows)} записей — пропускаем (нет привязки к жюри)")
-        except Exception:
-            pass
-
-    print(f"queue      : {total} записей перенесено")
-
-
-def _migrate_results(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
-    # Получаем ID постов жюри — их результаты не переносим
-    reviewer_posts = {
-        row[0]
-        for row in new.execute(
-            "SELECT ID FROM posts_info WHERE PostOfReviewer = 1"
-        ).fetchall()
-    }
-
-    rows = old.execute(
-        """
-        SELECT ID, Post, BotWords, HumanWords, HumanErrors,
-               Reviewer, SkipReason, RejectReason
-        FROM results
-        """
-    ).fetchall()
-
-    to_insert = [
-        (
-            r["ID"], r["Post"], r["BotWords"], r["HumanWords"], r["HumanErrors"],
-            r["Reviewer"], r["SkipReason"], r["RejectReason"],
-        )
-        for r in rows
-        if r["Post"] not in reviewer_posts
-    ]
-
-    skipped = len(rows) - len(to_insert)
-
-    new.executemany(
-        """
-        INSERT OR REPLACE INTO results
-            (ID, Post, BotWords, HumanWords, HumanErrors,
-             Reviewer, SkipReason, RejectReason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        to_insert,
-    )
-    new.commit()
-    print(f"results    : {len(to_insert)} записей (пропущено постов жюри: {skipped})")
-
-
-# ── Точка входа ───────────────────────────────────────────────────────────────
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Миграция БД inkstory v6 → v7 (единая таблица queue)")
-    parser.add_argument("--old", required=True, help="Путь к старой БД (v6, с queue_{TGID})")
-    parser.add_argument("--new", required=True, help="Путь к новой БД (v7, с единой queue)")
+    parser = argparse.ArgumentParser(
+        description="Миграция БД inkstory в новую схему"
+    )
+    parser.add_argument("--old", required=True, help="Путь к старой БД")
+    parser.add_argument("--new", required=True, help="Путь к новой (уже инициализированной) БД")
     args = parser.parse_args()
 
     old_path = pathlib.Path(args.old)
@@ -251,9 +289,9 @@ def main() -> None:
     if not old_path.exists():
         print(f"❌ Старая БД не найдена: {old_path}")
         sys.exit(1)
-
     if not new_path.exists():
         print(f"❌ Новая БД не найдена: {new_path}")
+        print("   Сначала запусти: python scripts/init_db.py")
         sys.exit(1)
 
     migrate(str(old_path), str(new_path))

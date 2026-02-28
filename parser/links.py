@@ -1,11 +1,11 @@
 """
-links.py — сбор ссылок на посты через JSON API inkstory.net
+parser/links.py — сбор ссылок на посты через JSON API inkstory.net
 
 Логика:
 1. Берём все известные ссылки из таблицы links
-2. Постранично запрашиваем API
+2. Постранично запрашиваем API (сортировка по дате убывания)
 3. Останавливаемся когда встречаем ссылку которая уже есть в БД
-4. Новые ссылки сохраняем с Parsed = 0
+4. Новые ссылки сохраняем с Parsed=0
 """
 
 import time
@@ -19,7 +19,7 @@ log = setup_logger()
 API_URL    = "https://api.inkstory.net/v2/discussions"
 SITE_BASE  = "https://inkstory.net"
 PAGE_SIZE  = 20
-PAGE_PAUSE = 1.0  # секунды между запросами к API
+PAGE_PAUSE = 1.0
 
 HEADERS = {
     "User-Agent": (
@@ -27,28 +27,22 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Mobile Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept":  "application/json",
     "Referer": "https://inkstory.net/",
 }
 
 
-# ── БД ────────────────────────────────────────────────────────────────────────
-
 def _get_known_links() -> set[str]:
-    """Возвращает все ссылки из таблицы links — используется как стоп-сигнал."""
     with get_db() as db:
-        rows = db.execute("SELECT URL FROM links").fetchall()
-        return {row["URL"] for row in rows}
+        return {row["URL"] for row in db.execute("SELECT URL FROM links").fetchall()}
 
 
 def _get_blacklist() -> set[str]:
     with get_db() as db:
-        rows = db.execute("SELECT URL FROM blacklist").fetchall()
-        return {row["URL"] for row in rows}
+        return {row["URL"] for row in db.execute("SELECT URL FROM blacklist").fetchall()}
 
 
 def _save_links(urls: list[str]) -> None:
-    """Сохраняет новые ссылки с Parsed = 0."""
     with get_db() as db:
         db.executemany(
             "INSERT OR IGNORE INTO links (URL, Parsed) VALUES (?, 0)",
@@ -57,20 +51,17 @@ def _save_links(urls: list[str]) -> None:
         db.commit()
 
 
-# ── API ───────────────────────────────────────────────────────────────────────
-
 def _fetch_page(page: int) -> dict | list | None:
-    """Загружает одну страницу API. Возвращает None при ошибке."""
     params = {
-        "size": PAGE_SIZE,
-        "sort": "createdAt,desc",
-        "page": page,
+        "size":           PAGE_SIZE,
+        "sort":           "createdAt,desc",
+        "page":           page,
         "includeContent": "true",
     }
     try:
-        response = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
     except requests.RequestException as e:
         log.error(f"[links] Ошибка запроса страницы {page}: {e}")
         return None
@@ -80,16 +71,11 @@ def _fetch_page(page: int) -> dict | list | None:
 
 
 def _extract_links(data: dict | list) -> tuple[list[str], bool]:
-    """
-    Извлекает ссылки из ответа API.
-    Возвращает (список ссылок, есть ли следующая страница).
-    """
     if isinstance(data, list):
-        items = data
+        items    = data
         has_next = len(data) == PAGE_SIZE
     else:
         items = data.get("content") or data.get("data") or data.get("items") or []
-
         if "last" in data:
             has_next = not data["last"]
         elif "hasNext" in data:
@@ -108,21 +94,18 @@ def _extract_links(data: dict | list) -> tuple[list[str], bool]:
     return urls, has_next
 
 
-# ── Основная функция ──────────────────────────────────────────────────────────
-
 def parse() -> int:
     """
-    Собирает новые ссылки и сохраняет их в БД с Parsed = 0.
-    Останавливается когда встречает ссылку которая уже есть в links.
-    Возвращает количество новых сохранённых ссылок.
+    Собирает новые ссылки и сохраняет их в БД с Parsed=0.
+    Возвращает количество новых ссылок.
     """
-    known   = _get_known_links()
+    known     = _get_known_links()
     blacklist = _get_blacklist()
-    log.info(f"[links] Известных ссылок: {len(known)}, в блэклисте: {len(blacklist)}")
+    log.info(f"[links] Известных: {len(known)}, в блэклисте: {len(blacklist)}")
 
-    new_urls = []
-    page     = 0
-    stop     = False
+    new_urls: list[str] = []
+    page = 0
+    stop = False
 
     while not stop:
         log.debug(f"[links] Запрашиваем страницу {page}")
@@ -140,7 +123,6 @@ def parse() -> int:
 
         for url in page_urls:
             if url in blacklist:
-                log.debug(f"[links] Блэклист: {url}")
                 continue
             if url in known:
                 log.info(f"[links] Дошли до известной ссылки: {url}")

@@ -2,23 +2,25 @@
 bot.py — запуск бота, регистрация хендлеров, планировщик задач
 
 Автоматические задачи:
-- Каждые N минут (из .env) — запуск парсера, уведомление жюри при новых постах
-- Каждые 5 минут — проверка просроченных постов (не проверены за 30 мин)
-- 23:55 — финальный запуск парсера
-- 00:01 — создание нового дня в таблице days
+- Каждые N минут — парсер + уведомление жюри
+- Каждые 5 минут — освобождение просроченных постов
+- 23:55 МСК — финальный парсинг
+- 00:01 МСК — создание нового дня
 """
 
 import sys
 import asyncio
 import pathlib
 import functools
+import os
 from datetime import datetime, time as dtime
 from pytz import timezone
 
 ROOT = pathlib.Path(__file__).parent
+sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv
-import os
+load_dotenv(ROOT / ".env")
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -28,8 +30,6 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
-
-load_dotenv(ROOT / ".env")
 
 from utils.database import get_db
 from utils.logger import setup_logger
@@ -41,28 +41,28 @@ from bot.handlers.user import (
     WAITING_REG_URL, WAITING_WORDS, WAITING_ERRORS,
     WAITING_SKIP_TEXT, WAITING_REJECT_REASON, WAITING_REJECT_CUSTOM,
 )
-from bot.handlers.admin import cmd_admin, cb_admin, cmd_shutdown, got_shutdown_reason, WAITING_SHUTDOWN_REASON
+from bot.handlers.admin import (
+    cmd_admin, cb_admin, cmd_shutdown, got_shutdown_reason,
+    WAITING_SHUTDOWN_REASON,
+)
 
 log = setup_logger()
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
-PARSER_INTERVAL = int(os.getenv("PARSER_INTERVAL", 30)) * 60  # минуты → секунды
+PARSER_INTERVAL = int(os.getenv("PARSER_INTERVAL", 30)) * 60
 MOSCOW_TZ       = timezone("Europe/Moscow")
 
 _parser_lock = asyncio.Lock()
 
 
-# ── Хелперы БД ────────────────────────────────────────────────────────────────
+# ── Хелперы ───────────────────────────────────────────────────────────────────
 
 def _get_all_reviewer_ids() -> list[str]:
     with get_db() as db:
-        rows = db.execute("SELECT TGID FROM reviewers WHERE Verified = 1").fetchall()
-        return [row["TGID"] for row in rows]
-
-
-def _get_queue_count() -> int:
-    from parser.queue_manager import get_total_queue_count
-    return get_total_queue_count()
+        rows = db.execute(
+            "SELECT TGID FROM reviewers WHERE Verified=1"
+        ).fetchall()
+        return [r["TGID"] for r in rows]
 
 
 def _create_new_day() -> str:
@@ -73,7 +73,7 @@ def _create_new_day() -> str:
     return today
 
 
-# ── Запуск парсера ────────────────────────────────────────────────────────────
+# ── Парсер ────────────────────────────────────────────────────────────────────
 
 def _run_parser_sync() -> dict:
     from parser.links import parse as parse_links
@@ -83,23 +83,15 @@ def _run_parser_sync() -> dict:
 
 
 async def _run_parser() -> dict | None:
-    """
-    Запускает парсер в отдельном потоке через run_in_executor.
-    Не блокирует event loop бота во время парсинга.
-    """
     if _parser_lock.locked():
         log.warning("[parser] Уже запущен, пропускаем")
         return None
 
     async with _parser_lock:
         try:
-            log.info("[parser] Запуск в executor...")
-            loop = asyncio.get_running_loop()
-            assigned = await loop.run_in_executor(
-                None,
-                functools.partial(_run_parser_sync),
-            )
-            log.info(f"[parser] Готово. В очереди: {_get_queue_count()}")
+            loop    = asyncio.get_running_loop()
+            assigned = await loop.run_in_executor(None, functools.partial(_run_parser_sync))
+            log.info(f"[parser] Готово. Назначено постов: {sum(assigned.values()) if assigned else 0}")
             return assigned if isinstance(assigned, dict) else {}
         except Exception as e:
             log.exception(f"[parser] Исключение: {e}")
@@ -109,14 +101,11 @@ async def _run_parser() -> dict | None:
 # ── Задачи планировщика ───────────────────────────────────────────────────────
 
 async def job_auto_parser(context):
-    """Автозапуск парсера по расписанию."""
     log.info("[job] Автозапуск парсера")
     assigned = await _run_parser()
-
     if not assigned:
         return
 
-    sent = 0
     for tg_id, count in assigned.items():
         try:
             await context.bot.send_message(
@@ -127,35 +116,31 @@ async def job_auto_parser(context):
                     f"/next — взять пост"
                 ),
             )
-            sent += 1
         except Exception as e:
             log.warning(f"[job] Не удалось уведомить {tg_id}: {e}")
 
-    log.info(f"[job] Уведомлено жюри: {sent}/{len(assigned)}")
-
 
 async def job_final_parser(context):
-    """23:55 — финальный запуск парсера."""
     log.info("[job] Финальный парсинг дня (23:55)")
     assigned = await _run_parser()
+    if not assigned:
+        return
 
-    if assigned:
-        for tg_id, count in assigned.items():
-            try:
-                await context.bot.send_message(
-                    chat_id=tg_id,
-                    text=(
-                        f"📬 Финальный сбор постов дня!\n\n"
-                        f"🆕 Тебе добавлено: {count}\n\n"
-                        f"/next — взять пост"
-                    ),
-                )
-            except Exception as e:
-                log.warning(f"[job] Не удалось уведомить {tg_id}: {e}")
+    for tg_id, count in assigned.items():
+        try:
+            await context.bot.send_message(
+                chat_id=tg_id,
+                text=(
+                    f"📬 Финальный сбор постов дня!\n\n"
+                    f"🆕 Тебе добавлено: {count}\n\n"
+                    f"/next — взять пост"
+                ),
+            )
+        except Exception as e:
+            log.warning(f"[job] Не удалось уведомить {tg_id}: {e}")
 
 
 async def job_new_day(context):
-    """00:01 по Москве — создаёт новый день в таблице days."""
     log.info("[job] Смена дня")
     today = _create_new_day()
     log.info(f"[job] Создан новый день: {today}")
@@ -163,63 +148,53 @@ async def job_new_day(context):
 
 async def job_check_expired(context):
     """
-    Каждые 5 минут проверяет посты которые назначены жюри но не проверены за 30 минут.
-    Освобождает их и уведомляет:
-    - жюри который не проверил — что посты у него забрали
-    - всех остальных жюри — что появились свободные посты
+    Каждые 5 минут освобождает просроченные посты и уведомляет жюри.
     """
-    from parser.queue_manager import release_expired_posts, get_free_posts
+    from parser.queue_manager import release_expired_posts, get_free_posts_count
 
     released = release_expired_posts()
     if not released:
         return
 
-    log.info(f"[expired] Освобождено постов: {len(released)}")
+    log.info(f"[expired] Освобождено: {len(released)}")
 
-    # Группируем по жюри который не проверил
-    by_reviewer: dict[str, list] = {}
+    # Уведомляем жюри у которых забрали посты
+    notified = set()
     for item in released:
         tgid = item["reviewer_tgid"]
-        by_reviewer.setdefault(tgid, []).append(item)
-
-    # Уведомляем виновных жюри
-    for tgid, posts in by_reviewer.items():
+        notified.add(tgid)
         try:
-            count = len(posts)
             await context.bot.send_message(
                 chat_id=tgid,
                 text=(
-                    f"⏰ У тебя истекло время на проверку!\n\n"
-                    f"{'Пост был' if count == 1 else f'{count} постов было'} возвращено в общую очередь — "
-                    f"{'его' if count == 1 else 'их'} могут взять другие жюри.\n\n"
-                    f"Если хочешь продолжить — используй /next."
+                    "⏰ У тебя истекло время на проверку!\n\n"
+                    "Пост возвращён в общую очередь.\n\n"
+                    "Если хочешь продолжить — используй /next."
                 ),
             )
         except Exception as e:
             log.warning(f"[expired] Не удалось уведомить {tgid}: {e}")
 
-    # Уведомляем всех остальных жюри что есть свободные посты
-    free_count = len(get_free_posts())
-    all_reviewers = _get_all_reviewer_ids()
-    notified_tgids = set(by_reviewer.keys())
-
-    for tgid in all_reviewers:
-        if tgid in notified_tgids:
-            continue
-        try:
-            await context.bot.send_message(
-                chat_id=tgid,
-                text=(
-                    f"📬 Появились свободные посты!\n\n"
-                    f"📋 Доступно: {free_count}\n\n"
-                    f"/next — взять пост"
-                ),
-            )
-        except Exception as e:
-            log.warning(f"[expired] Не удалось уведомить {tgid}: {e}")
+    # Уведомляем остальных жюри о свободных постах
+    free_count = get_free_posts_count()
+    if free_count > 0:
+        for tgid in _get_all_reviewer_ids():
+            if tgid in notified:
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=tgid,
+                    text=(
+                        f"📬 Появились свободные посты!\n\n"
+                        f"📋 Доступно: {free_count}\n\n"
+                        f"/next — взять пост"
+                    ),
+                )
+            except Exception as e:
+                log.warning(f"[expired] Не удалось уведомить {tgid}: {e}")
 
 
-# ── Запуск бота ───────────────────────────────────────────────────────────────
+# ── Запуск ────────────────────────────────────────────────────────────────────
 
 def run():
     if not BOT_TOKEN:
@@ -231,13 +206,13 @@ def run():
     log.info("=" * 50)
 
     async def on_startup(app):
-        reviewer_ids = _get_all_reviewer_ids()
-        for tg_id in reviewer_ids:
+        for tg_id in _get_all_reviewer_ids():
             try:
-                await app.bot.send_message(chat_id=tg_id, text="🟢 Бот запущен и готов к работе!")
+                await app.bot.send_message(
+                    chat_id=tg_id, text="🟢 Бот запущен и готов к работе!"
+                )
             except Exception:
                 pass
-        log.info(f"[startup] Уведомлено жюри: {len(reviewer_ids)}")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
 
@@ -288,7 +263,9 @@ def run():
     shutdown_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(cmd_shutdown, pattern="^admin_shutdown$")],
         states={
-            WAITING_SHUTDOWN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_shutdown_reason)],
+            WAITING_SHUTDOWN_REASON: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_shutdown_reason)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
@@ -305,39 +282,14 @@ def run():
 
     # ── Планировщик ───────────────────────────────────────────────────────────
     jq = app.job_queue
-
-    jq.run_repeating(
-        job_auto_parser,
-        interval=PARSER_INTERVAL,
-        first=60,
-        name="auto_parser",
-    )
-
-    # Проверка просроченных постов каждые 5 минут
-    jq.run_repeating(
-        job_check_expired,
-        interval=5 * 60,
-        first=60,
-        name="check_expired",
-    )
-
-    # Финальный парсинг и смена дня — с московским временем
-    jq.run_daily(
-        job_final_parser,
-        time=dtime(hour=23, minute=55, tzinfo=MOSCOW_TZ),
-        name="final_parser",
-    )
-
-    jq.run_daily(
-        job_new_day,
-        time=dtime(hour=0, minute=1, tzinfo=MOSCOW_TZ),
-        name="new_day",
-    )
+    jq.run_repeating(job_auto_parser,    interval=PARSER_INTERVAL, first=60,    name="auto_parser")
+    jq.run_repeating(job_check_expired,  interval=5 * 60,          first=60,    name="check_expired")
+    jq.run_daily(job_final_parser, time=dtime(hour=23, minute=55, tzinfo=MOSCOW_TZ), name="final_parser")
+    jq.run_daily(job_new_day,      time=dtime(hour=0,  minute=1,  tzinfo=MOSCOW_TZ), name="new_day")
 
     log.info(
         f"[scheduler] Автопарсер каждые {PARSER_INTERVAL // 60} мин, "
-        f"проверка просроченных каждые 5 мин, "
-        f"финальный в 23:55 МСК, смена дня в 00:01 МСК"
+        f"просроченные каждые 5 мин, финальный 23:55, смена дня 00:01 МСК"
     )
 
     app.run_polling()

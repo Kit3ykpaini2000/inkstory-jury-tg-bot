@@ -1,243 +1,363 @@
 """
 parser/queue_manager.py — управление очередью жюри
 
-Структура:
-- Единая таблица queue (Reviewer, Post, AssignedAt)
-- При появлении нового поста он идёт жюри с наименьшей текущей очередью
-- Если жюри не проверил пост за EXPIRE_MINUTES минут — пост освобождается
-- Освобождённые посты доступны любому жюри через /next
+Два режима (задаются в таблице config, ключ queue_mode):
+
+  open         — общая очередь, любой жюри берёт первый свободный пост через /next
+  distributed  — пост сразу назначается жюри с наименьшей очередью
+
+В обоих режимах:
+  - Если жюри взял пост (TakenAt IS NOT NULL) но не проверил за expire_minutes минут
+    → Reviewer=NULL, TakenAt=NULL, Status='pending' (пост снова свободен)
+  - Если в режиме distributed пост назначен (Reviewer IS NOT NULL)
+    но не взят (TakenAt IS NULL) за expire_minutes минут
+    → Reviewer=NULL (становится свободным как в open)
 """
 
 import random
 from datetime import datetime, timezone
-from utils.database import get_db
+
+from utils.database import get_db, get_queue_mode, get_expire_minutes
 from utils.logger import setup_logger
 
 log = setup_logger()
 
-EXPIRE_MINUTES = 30  # через сколько минут пост освобождается
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ── Инициализация таблицы ─────────────────────────────────────────────────────
+# ── Распределение ─────────────────────────────────────────────────────────────
 
-def ensure_queue_table() -> None:
-    """Создаёт таблицу queue если не существует."""
-    with get_db() as db:
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS queue (
-                Reviewer   TEXT    NOT NULL,
-                Post       INTEGER NOT NULL,
-                AssignedAt TEXT    NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (Reviewer, Post),
-                FOREIGN KEY (Reviewer) REFERENCES reviewers(TGID),
-                FOREIGN KEY (Post)     REFERENCES posts_info(ID)
-            )
-            """
-        )
-        # Добавляем колонку AssignedAt если её нет (миграция старой БД)
-        try:
-            db.execute("ALTER TABLE queue ADD COLUMN AssignedAt TEXT NOT NULL DEFAULT (datetime('now'))")
-        except Exception:
-            pass  # уже есть
-        db.execute("CREATE INDEX IF NOT EXISTS idx_queue_reviewer   ON queue(Reviewer)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_queue_post       ON queue(Post)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_queue_assignedat ON queue(AssignedAt)")
-        db.commit()
-    log.debug("[queue_manager] Таблица queue готова")
-
-
-def ensure_all_queues() -> None:
-    ensure_queue_table()
-
-
-def create_queue(tgid: str) -> None:
-    ensure_queue_table()
-
-
-# ── Распределение постов ──────────────────────────────────────────────────────
-
-def _get_reviewer_queue_sizes() -> list[dict]:
+def _reviewer_with_least_queue() -> str | None:
     """
-    Возвращает верифицированных жюри отсортированных по размеру текущей очереди.
-    Распределение по текущей нагрузке — не по истории.
+    Возвращает TGID верифицированного жюри с наименьшей очередью.
+    При ничье выбирает случайно.
     """
     with get_db() as db:
         rows = db.execute(
             """
             SELECT rv.TGID,
-                   COUNT(q.Post) as cnt
+                   COUNT(q.Post) AS cnt
             FROM reviewers rv
             LEFT JOIN queue q ON q.Reviewer = rv.TGID
-            LEFT JOIN posts_info p ON q.Post = p.ID
-                AND p.Rejected     = 0
-                AND p.HumanChecked = 0
             WHERE rv.Verified = 1
             GROUP BY rv.TGID
             ORDER BY cnt ASC
             """
         ).fetchall()
-    return [{"tgid": r["TGID"], "count": r["cnt"]} for r in rows]
+
+    if not rows:
+        return None
+
+    min_cnt    = rows[0]["cnt"]
+    candidates = [r["TGID"] for r in rows if r["cnt"] == min_cnt]
+    return random.choice(candidates)
 
 
 def assign_post(post_id: int) -> str | None:
     """
-    Распределяет пост жюри с наименьшей текущей очередью.
-    Если несколько одинаковых — выбирает рандомно среди них.
-    Возвращает TGID выбранного жюри или None если жюри нет.
-    """
-    ensure_queue_table()
+    Добавляет пост в очередь согласно текущему режиму.
 
-    reviewers = _get_reviewer_queue_sizes()
-    if not reviewers:
-        log.warning(f"[queue_manager] Нет верифицированных жюри для поста #{post_id}")
+    open        → queue(Post, Reviewer=NULL)
+    distributed → queue(Post, Reviewer=<жюри с минимальной очередью>)
+
+    Возвращает TGID назначенного жюри или None (в режиме open или нет жюри).
+    """
+    mode = get_queue_mode()
+
+    if mode == "open":
+        with get_db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?,NULL,?)",
+                (post_id, _now_utc()),
+            )
+            db.commit()
+        log.info(f"[queue] Пост #{post_id} → общая очередь (open)")
         return None
 
-    min_count  = reviewers[0]["count"]
-    candidates = [r for r in reviewers if r["count"] == min_count]
-    chosen     = random.choice(candidates)
-    tgid       = chosen["tgid"]
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # distributed
+    tgid = _reviewer_with_least_queue()
+    if not tgid:
+        # Жюри нет — кладём в общую как в open
+        with get_db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?,NULL,?)",
+                (post_id, _now_utc()),
+            )
+            db.commit()
+        log.warning(f"[queue] Нет жюри для поста #{post_id} — в общую очередь")
+        return None
 
     with get_db() as db:
         db.execute(
-            "INSERT OR IGNORE INTO queue (Reviewer, Post, AssignedAt) VALUES (?, ?, ?)",
-            (tgid, post_id, now),
+            "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?,?,?)",
+            (post_id, tgid, _now_utc()),
         )
         db.commit()
 
-    log.info(f"[queue_manager] Пост #{post_id} → {tgid} (в очереди: {min_count})")
+    log.info(f"[queue] Пост #{post_id} → {tgid} (distributed)")
     return tgid
+
+
+# ── Получение поста жюри ──────────────────────────────────────────────────────
+
+def take_post(tgid: str) -> dict | None:
+    """
+    Атомарно резервирует следующий пост для жюри (вызывается при /next).
+
+    Порядок поиска:
+    1. Пост уже назначен этому жюри и не взят (Reviewer=tgid, TakenAt IS NULL)
+    2. Свободный пост (Reviewer IS NULL, TakenAt IS NULL)
+
+    Возвращает dict с данными поста или None если нет доступных.
+    """
+    with get_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        # 1. Свой назначенный пост
+        row = db.execute(
+            """
+            SELECT q.Post, p.URL, a.Name AS author, r.BotWords,
+                   q.AssignedAt, q.TakenAt
+            FROM queue q
+            JOIN posts_info p ON q.Post = p.ID
+            JOIN authors    a ON p.Author = a.ID
+            LEFT JOIN results r ON r.Post = p.ID
+            WHERE q.Reviewer  = ?
+              AND q.TakenAt   IS NULL
+              AND p.Status    = 'pending'
+            ORDER BY q.AssignedAt ASC
+            LIMIT 1
+            """,
+            (tgid,),
+        ).fetchone()
+
+        # 2. Свободный пост
+        if not row:
+            row = db.execute(
+                """
+                SELECT q.Post, p.URL, a.Name AS author, r.BotWords,
+                       q.AssignedAt, q.TakenAt
+                FROM queue q
+                JOIN posts_info p ON q.Post = p.ID
+                JOIN authors    a ON p.Author = a.ID
+                LEFT JOIN results r ON r.Post = p.ID
+                WHERE q.Reviewer IS NULL
+                  AND q.TakenAt  IS NULL
+                  AND p.Status   = 'pending'
+                ORDER BY q.AssignedAt ASC
+                LIMIT 1
+                """,
+            ).fetchone()
+
+        if not row:
+            db.execute("ROLLBACK")
+            return None
+
+        post_id = row["Post"]
+        now     = _now_utc()
+
+        # Резервируем: назначаем жюри и ставим TakenAt
+        db.execute(
+            "UPDATE queue SET Reviewer=?, TakenAt=? WHERE Post=? AND TakenAt IS NULL",
+            (tgid, now, post_id),
+        )
+        db.execute(
+            "UPDATE posts_info SET Status='checking' WHERE ID=? AND Status='pending'",
+            (post_id,),
+        )
+        db.execute("COMMIT")
+
+    log.info(f"[queue] Жюри {tgid} взял пост #{post_id}")
+    return {
+        "post_id": post_id,
+        "url":     row["url"],
+        "author":  row["author"],
+        "bot_words": row["BotWords"],
+    }
+
+
+def get_active_post(tgid: str) -> dict | None:
+    """Возвращает пост который жюри уже взял но ещё не проверил."""
+    with get_db() as db:
+        row = db.execute(
+            """
+            SELECT q.Post, p.URL, a.Name AS author, r.BotWords
+            FROM queue q
+            JOIN posts_info p ON q.Post = p.ID
+            JOIN authors    a ON p.Author = a.ID
+            LEFT JOIN results r ON r.Post = p.ID
+            WHERE q.Reviewer = ?
+              AND q.TakenAt  IS NOT NULL
+              AND p.Status   = 'checking'
+            LIMIT 1
+            """,
+            (tgid,),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {
+        "post_id":   row["Post"],
+        "url":       row["url"],
+        "author":    row["author"],
+        "bot_words": row["BotWords"],
+    }
+
+
+def release_post(tgid: str, post_id: int) -> None:
+    """Освобождает пост обратно в очередь (отмена через /cancel)."""
+    with get_db() as db:
+        db.execute(
+            "UPDATE queue SET Reviewer=NULL, TakenAt=NULL WHERE Post=? AND Reviewer=?",
+            (post_id, tgid),
+        )
+        db.execute(
+            "UPDATE posts_info SET Status='pending' WHERE ID=? AND Status='checking'",
+            (post_id,),
+        )
+        db.commit()
+    log.info(f"[queue] Пост #{post_id} освобождён жюри {tgid}")
+
+
+def remove_post(post_id: int) -> None:
+    """Удаляет пост из очереди полностью (после проверки или отклонения)."""
+    with get_db() as db:
+        db.execute("DELETE FROM queue WHERE Post=?", (post_id,))
+        db.commit()
+    log.info(f"[queue] Пост #{post_id} удалён из очереди")
 
 
 # ── Просроченные посты ────────────────────────────────────────────────────────
 
-def get_expired_posts() -> list[dict]:
-    """
-    Возвращает посты которые назначены жюри но не проверены за EXPIRE_MINUTES минут.
-    Возвращает список {post_id, reviewer_tgid, reviewer_name}.
-    """
-    ensure_queue_table()
-    with get_db() as db:
-        rows = db.execute(
-            f"""
-            SELECT q.Post, q.Reviewer, rv.Name as reviewer_name
-            FROM queue q
-            JOIN posts_info p ON q.Post = p.ID
-            JOIN reviewers rv ON q.Reviewer = rv.TGID
-            LEFT JOIN results r ON r.Post = p.ID
-            WHERE p.Rejected     = 0
-              AND p.HumanChecked  = 0
-              AND r.HumanWords    IS NULL
-              AND r.Reviewer      IS NULL
-              AND datetime(q.AssignedAt) <= datetime('now', '-{EXPIRE_MINUTES} minutes')
-            """,
-        ).fetchall()
-    return [{"post_id": r["Post"], "reviewer_tgid": r["Reviewer"], "reviewer_name": r["reviewer_name"]} for r in rows]
-
-
 def release_expired_posts() -> list[dict]:
     """
-    Освобождает просроченные посты — убирает из очереди конкретного жюри.
-    Возвращает список освобождённых постов для уведомлений.
-    """
-    expired = get_expired_posts()
-    if not expired:
-        return []
+    Освобождает просроченные посты.
 
+    Два случая:
+    1. Жюри взял пост (TakenAt IS NOT NULL) но не проверил за expire_minutes
+       → Reviewer=NULL, TakenAt=NULL, Status='pending'
+       → уведомляем жюри что у него забрали пост
+
+    2. В режиме distributed пост назначен (Reviewer IS NOT NULL)
+       но не взят (TakenAt IS NULL) за expire_minutes
+       → Reviewer=NULL (становится свободным)
+       → без уведомления (жюри ещё даже не видел пост)
+
+    Возвращает список {post_id, reviewer_tgid, type: 'taken'|'assigned'}
+    только для case 1 (для уведомлений).
+    """
+    expire = get_expire_minutes()
     released = []
+
     with get_db() as db:
-        for item in expired:
-            # Убираем из личной очереди жюри
+        # Case 1: взят но не проверен
+        taken = db.execute(
+            f"""
+            SELECT q.Post, q.Reviewer
+            FROM queue q
+            JOIN posts_info p ON q.Post = p.ID
+            WHERE q.TakenAt IS NOT NULL
+              AND p.Status = 'checking'
+              AND datetime(q.TakenAt) <= datetime('now', '-{expire} minutes')
+            """
+        ).fetchall()
+
+        for row in taken:
             db.execute(
-                "DELETE FROM queue WHERE Reviewer = ? AND Post = ?",
-                (item["reviewer_tgid"], item["post_id"]),
+                "UPDATE queue SET Reviewer=NULL, TakenAt=NULL WHERE Post=?",
+                (row["Post"],),
             )
-            released.append(item)
+            db.execute(
+                "UPDATE posts_info SET Status='pending' WHERE ID=?",
+                (row["Post"],),
+            )
+            released.append({
+                "post_id":       row["Post"],
+                "reviewer_tgid": row["Reviewer"],
+                "type":          "taken",
+            })
+            log.info(f"[queue] Пост #{row['Post']} истёк (взят) у {row['Reviewer']}")
+
+        # Case 2: назначен но не взят (только distributed)
+        assigned = db.execute(
+            f"""
+            SELECT q.Post, q.Reviewer
+            FROM queue q
+            JOIN posts_info p ON q.Post = p.ID
+            WHERE q.Reviewer IS NOT NULL
+              AND q.TakenAt  IS NULL
+              AND p.Status   = 'pending'
+              AND datetime(q.AssignedAt) <= datetime('now', '-{expire} minutes')
+            """
+        ).fetchall()
+
+        for row in assigned:
+            db.execute(
+                "UPDATE queue SET Reviewer=NULL WHERE Post=?",
+                (row["Post"],),
+            )
+            log.info(f"[queue] Пост #{row['Post']} истёк (назначен) у {row['Reviewer']}")
+
         db.commit()
 
-    log.info(f"[queue_manager] Освобождено просроченных постов: {len(released)}")
+    if released:
+        log.info(f"[queue] Освобождено просроченных (взятых): {len(released)}")
+    if assigned:
+        log.info(f"[queue] Освобождено просроченных (назначенных): {len(assigned)}")
+
     return released
 
 
-def get_free_posts() -> list[int]:
-    """
-    Возвращает посты которые не назначены ни одному жюри — свободные для любого.
-    """
-    ensure_queue_table()
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT p.ID
-            FROM posts_info p
-            JOIN results r ON r.Post = p.ID
-            WHERE p.Rejected      = 0
-              AND p.HumanChecked  = 0
-              AND p.PostOfReviewer = 0
-              AND r.Reviewer IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM queue q WHERE q.Post = p.ID
-              )
-            ORDER BY p.ID ASC
-            """
-        ).fetchall()
-    return [r["ID"] for r in rows]
-
-
-# ── Работа с личной очередью ──────────────────────────────────────────────────
-
-def get_queue_posts(tgid: str) -> list[int]:
-    """Возвращает список ID постов в личной очереди жюри."""
-    ensure_queue_table()
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT q.Post FROM queue q
-            JOIN posts_info p ON q.Post = p.ID
-            WHERE q.Reviewer      = ?
-              AND p.Rejected      = 0
-              AND p.HumanChecked  = 0
-            ORDER BY q.AssignedAt ASC
-            """,
-            (tgid,),
-        ).fetchall()
-    return [r["Post"] for r in rows]
-
-
-def remove_from_queue(tgid: str, post_id: int) -> None:
-    """Удаляет пост из очереди конкретного жюри."""
-    with get_db() as db:
-        db.execute(
-            "DELETE FROM queue WHERE Reviewer = ? AND Post = ?",
-            (tgid, post_id),
-        )
-        db.commit()
-
-
-def remove_from_all_queues(post_id: int) -> None:
-    """Удаляет пост из очередей всех жюри (при отклонении или проверке)."""
-    with get_db() as db:
-        db.execute("DELETE FROM queue WHERE Post = ?", (post_id,))
-        db.commit()
-    log.info(f"[queue_manager] Пост #{post_id} удалён из очереди")
-
+# ── Статистика ────────────────────────────────────────────────────────────────
 
 def get_queue_count(tgid: str) -> int:
-    """Возвращает количество постов в очереди жюри."""
-    return len(get_queue_posts(tgid))
+    """Количество постов в очереди конкретного жюри."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) FROM queue WHERE Reviewer=?", (tgid,)
+        ).fetchone()
+    return row[0] if row else 0
 
 
 def get_total_queue_count() -> int:
-    """Возвращает суммарное количество уникальных постов во всех очередях."""
-    ensure_queue_table()
+    """Общее количество постов в очереди (уникальных)."""
     with get_db() as db:
         row = db.execute(
             """
-            SELECT COUNT(DISTINCT q.Post)
-            FROM queue q
+            SELECT COUNT(*) FROM queue q
             JOIN posts_info p ON q.Post = p.ID
-            WHERE p.Rejected = 0 AND p.HumanChecked = 0
+            WHERE p.Status IN ('pending', 'checking')
             """
         ).fetchone()
     return row[0] if row else 0
+
+
+def get_free_posts_count() -> int:
+    """Количество свободных постов (Reviewer IS NULL)."""
+    with get_db() as db:
+        row = db.execute(
+            """
+            SELECT COUNT(*) FROM queue q
+            JOIN posts_info p ON q.Post = p.ID
+            WHERE q.Reviewer IS NULL AND p.Status = 'pending'
+            """
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def get_all_reviewer_queue_sizes() -> list[dict]:
+    """Возвращает размер очереди каждого верифицированного жюри."""
+    with get_db() as db:
+        rows = db.execute(
+            """
+            SELECT rv.TGID, rv.Name, COUNT(q.Post) AS cnt
+            FROM reviewers rv
+            LEFT JOIN queue q ON q.Reviewer = rv.TGID
+            WHERE rv.Verified = 1
+            GROUP BY rv.TGID
+            ORDER BY cnt DESC
+            """
+        ).fetchall()
+    return [{"tgid": r["TGID"], "name": r["Name"], "count": r["cnt"]} for r in rows]

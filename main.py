@@ -1,21 +1,6 @@
-import sys as _sys
-import pathlib as _pathlib
-_ROOT = _pathlib.Path(__file__).parent
-if str(_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_ROOT))
-
-"""
-main.py — точка входа парсера
-
-Запуск: python main.py
-
-Шаги:
-1. Сбор новых ссылок (links.py)
-2. Парсинг постов по ссылкам (posts.py)
-"""
-
 import sys
 import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from parser.links import parse as parse_links
 from parser.posts import parse as parse_posts
@@ -36,7 +21,7 @@ def main() -> None:
     new_posts = parse_posts()
 
     log.info("=" * 50)
-    log.info(f"Готово. Новых ссылок: {new_links}, постов в очереди: {new_posts}")
+    log.info(f"Готово. Новых ссылок: {new_links}, постов назначено: {sum(new_posts.values())}")
     log.info("=" * 50)
 
 

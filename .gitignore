@@ -1,14 +1,30 @@
-# Env
+# Окружение
 .env
-
-# Python cache
-data/main.db
-data/main.db-shm
-data/main.db-wal
-logs/
+venv/
+.venv/
 __pycache__/
-*.pyc-e 
+*.pyc
+*.pyo
+*.pyd
+.Python
 
-# Экспорт результатов (генерируется автоматически)
-results/*.xlsx
-results/*.csv
+# БД и данные
+data/main.db
+data/*.db
+
+# Логи
+logs/
+*.log
+
+# Результаты экспорта
+results/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
