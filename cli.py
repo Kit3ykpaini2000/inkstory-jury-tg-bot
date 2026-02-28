@@ -7,23 +7,21 @@ cli.py — консольное управление БД inkstory
 import os
 import sys
 import pathlib
-
-ROOT = pathlib.Path(__file__).parent
 import sqlite3
 from datetime import datetime
+
+ROOT = pathlib.Path(__file__).parent
 
 from utils.database import get_db
 
 try:
     from parser.queue_manager import (
         get_total_queue_count, get_queue_count, assign_post,
-        remove_from_queue, remove_from_all_queues, create_queue
+        remove_post, release_post, get_all_reviewer_queue_sizes,
     )
     _QM = True
 except ImportError:
     _QM = False
-
-LOG_FILE = ROOT / "logs" / "app.log"
 
 # ── Цвета ─────────────────────────────────────────────────────────────────────
 
@@ -93,22 +91,18 @@ def menu(title: str, options: list, show_stats: bool = False) -> int:
 def _quick_stats() -> str:
     try:
         with get_db() as db:
-            in_queue = db.execute(
-0  # заменено queue_manager
-            ).fetchone()
-            in_queue = 0  # подставляется ниже
-            checked = db.execute(
-                "SELECT COUNT(*) FROM posts_info WHERE HumanChecked=1 AND Rejected=0"
+            done = db.execute(
+                "SELECT COUNT(*) FROM posts_info WHERE Status='done'"
             ).fetchone()[0]
-            stuck = db.execute(
-                "SELECT COUNT(*) FROM results r JOIN posts_info p ON p.ID = r.Post WHERE r.Reviewer IS NOT NULL AND r.HumanWords IS NULL AND p.Rejected = 0"
+            checking = db.execute(
+                "SELECT COUNT(*) FROM posts_info WHERE Status='checking'"
             ).fetchone()[0]
-        in_queue  = get_total_queue_count() if _QM else 0
-        stuck_str = f"  {R}🔒 Зависших: {stuck}{RESET}" if stuck else ""
+        in_queue = get_total_queue_count() if _QM else 0
+        checking_str = f"  {Y}🔒 Проверяется: {checking}{RESET}" if checking else ""
         return (
             f"  {B}📋 В очереди: {in_queue}{RESET}   "
-            f"{G}✅ Проверено: {checked}{RESET}"
-            f"{stuck_str}"
+            f"{G}✅ Проверено: {done}{RESET}"
+            f"{checking_str}"
         )
     except Exception:
         return ""
@@ -121,15 +115,13 @@ def _quick_stats() -> str:
 def show_stats():
     header("📊 Статистика")
     with get_db() as db:
-        in_queue = get_total_queue_count() if _QM else 0
-        checked   = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE HumanChecked=1 AND Rejected=0 AND PostOfReviewer=0"
-        ).fetchone()[0]
-        rejected  = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Rejected=1 AND PostOfReviewer=0"
-        ).fetchone()[0]
+        in_queue  = get_total_queue_count() if _QM else 0
+        pending   = db.execute("SELECT COUNT(*) FROM posts_info WHERE Status='pending'").fetchone()[0]
+        checking  = db.execute("SELECT COUNT(*) FROM posts_info WHERE Status='checking'").fetchone()[0]
+        done      = db.execute("SELECT COUNT(*) FROM posts_info WHERE Status='done'").fetchone()[0]
+        rejected  = db.execute("SELECT COUNT(*) FROM posts_info WHERE Status='rejected'").fetchone()[0]
         total     = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE PostOfReviewer=0"
+            "SELECT COUNT(*) FROM posts_info WHERE Status NOT IN ('reviewer_post')"
         ).fetchone()[0]
         reviewers = db.execute("SELECT COUNT(*) FROM reviewers").fetchone()[0]
         links     = db.execute("SELECT COUNT(*) FROM links").fetchone()[0]
@@ -137,8 +129,8 @@ def show_stats():
         rows = db.execute(
             """
             SELECT rv.Name,
-                   COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) as checked,
-                   COUNT(CASE WHEN p.Rejected=1 AND r.Reviewer=rv.TGID THEN 1 END) as rejected
+                   COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked,
+                   COUNT(CASE WHEN p.Status='rejected' AND r.Reviewer=rv.TGID THEN 1 END) AS rejected
             FROM reviewers rv
             LEFT JOIN results    r ON r.Reviewer = rv.TGID
             LEFT JOIN posts_info p ON p.ID = r.Post
@@ -147,12 +139,14 @@ def show_stats():
             """
         ).fetchall()
 
-    print(f"  {G}✅ Проверено:{RESET}      {checked}")
-    print(f"  {B}📋 В очереди:{RESET}      {in_queue}")
-    print(f"  {R}❌ Отклонено:{RESET}      {rejected}")
-    print(f"  {W}📦 Всего постов:{RESET}   {total}")
-    print(f"  {Y}🔗 Ссылок в БД:{RESET}    {links}")
-    print(f"  {W}👥 Жюри:{RESET}           {reviewers}")
+    print(f"  {Y}⏳ Ожидает проверки:{RESET}  {pending}")
+    print(f"  {Y}🔒 Проверяется:{RESET}        {checking}")
+    print(f"  {G}✅ Проверено:{RESET}          {done}")
+    print(f"  {R}❌ Отклонено:{RESET}          {rejected}")
+    print(f"  {W}📦 Всего постов:{RESET}       {total}")
+    print(f"  {B}📋 В очереди:{RESET}          {in_queue}")
+    print(f"  {Y}🔗 Ссылок в БД:{RESET}        {links}")
+    print(f"  {W}👥 Жюри:{RESET}               {reviewers}")
 
     if rows:
         print()
@@ -174,6 +168,7 @@ def show_stats():
 def manage_reviewers():
     actions = [
         list_reviewers, add_reviewer,
+        lambda: set_verified(1), lambda: set_verified(0),
         lambda: set_admin(1), lambda: set_admin(0),
         delete_reviewer,
     ]
@@ -181,6 +176,8 @@ def manage_reviewers():
         choice = menu("👥 Управление жюри", [
             "Список жюри",
             "Добавить жюри",
+            "Верифицировать жюри",
+            "Снять верификацию",
             "Сделать администратором",
             "Снять права администратора",
             "Удалить жюри",
@@ -194,16 +191,17 @@ def list_reviewers():
     header("👥 Список жюри")
     with get_db() as db:
         rows = db.execute(
-            "SELECT TGID, Name, URL, IsAdmin FROM reviewers ORDER BY Name"
+            "SELECT TGID, Name, URL, IsAdmin, Verified FROM reviewers ORDER BY Name"
         ).fetchall()
     if not rows:
         print(f"  {DIM}Жюри не зарегистрированы.{RESET}")
     else:
-        print(f"  {'TGID':<15} {'Имя':<22} {'Адм':4}")
+        print(f"  {'TGID':<15} {'Имя':<22} {'Верф':4} {'Адм':4}")
         hr()
         for r in rows:
-            adm = f"{Y}★{RESET}" if r["IsAdmin"] else " "
-            print(f"  {r['TGID']:<15} {r['Name']:<22} {adm}")
+            adm  = f"{Y}★{RESET}" if r["IsAdmin"]  else " "
+            ver  = f"{G}✓{RESET}" if r["Verified"] else f"{R}✗{RESET}"
+            print(f"  {r['TGID']:<15} {r['Name']:<22} {ver}    {adm}")
     pause()
 
 
@@ -234,13 +232,26 @@ def add_reviewer():
     with get_db() as db:
         try:
             db.execute(
-                "INSERT INTO reviewers (TGID, URL, Name, IsAdmin) VALUES (?, ?, ?, ?)",
+                "INSERT INTO reviewers (TGID, URL, Name, IsAdmin, Verified) VALUES (?, ?, ?, ?, 0)",
                 (tg_id, url, name, 1 if is_adm else 0),
             )
             db.commit()
-            print(f"\n{G}  ✅ Жюри {name} добавлен.{RESET}")
+            print(f"\n{G}  ✅ Жюри {name} добавлен (не верифицирован).{RESET}")
         except sqlite3.IntegrityError:
             print(f"\n{R}  ❌ Такой tgID уже есть в БД.{RESET}")
+    pause()
+
+
+def set_verified(value: int):
+    title = "Верифицировать жюри" if value else "Снять верификацию"
+    tgid = _pick_reviewer(title)
+    if not tgid:
+        return
+    with get_db() as db:
+        db.execute("UPDATE reviewers SET Verified=? WHERE TGID=?", (value, tgid))
+        db.commit()
+    status = f"{G}верифицирован{RESET}" if value else f"{Y}верификация снята{RESET}"
+    print(f"\n  ✅ Жюри tgID={tgid} {status}")
     pause()
 
 
@@ -280,7 +291,8 @@ def delete_reviewer():
 def manage_posts():
     actions = [
         view_all_posts, view_queue, find_post, find_post_by_author,
-        release_stuck, reset_post, reject_post_cli, restore_post, clear_queue,
+        release_stuck, reset_post, reject_post_cli, restore_post,
+        reassign_queue, clear_queue,
     ]
     while True:
         choice = menu("📝 Управление постами", [
@@ -292,31 +304,43 @@ def manage_posts():
             "Сбросить проверку поста",
             "Отклонить пост вручную",
             "Восстановить отклонённый пост",
-            "Очистить всю очередь",
+            "🔄 Переназначить очередь заново",
+            "🗑  Очистить всю очередь",
         ])
         if choice == -1:
             return
         actions[choice]()
 
 
+def _status_label(status: str) -> str:
+    return {
+        "pending":       f"{Y}ожидает{RESET}",
+        "checking":      f"{B}проверяется{RESET}",
+        "done":          f"{G}проверен{RESET}",
+        "rejected":      f"{R}отклонён{RESET}",
+        "reviewer_post": f"{DIM}жюри-пост{RESET}",
+    }.get(status, status)
+
+
 def view_all_posts():
     header("📄 Все посты")
-    status_opts = ["Все", "В очереди", "Проверены", "Отклонённые"]
+    status_opts = ["Все", "Ожидают", "Проверяются", "Проверены", "Отклонённые"]
     status_idx  = menu("Фильтр по статусу", status_opts)
     if status_idx == -1:
         return
 
     where = {
-        0: "WHERE p.PostOfReviewer=0",
-        1: "WHERE p.HumanChecked=0 AND p.Rejected=0 AND p.PostOfReviewer=0",
-        2: "WHERE p.HumanChecked=1 AND p.Rejected=0 AND p.PostOfReviewer=0",
-        3: "WHERE p.Rejected=1 AND p.PostOfReviewer=0",
+        0: "WHERE p.Status != 'reviewer_post'",
+        1: "WHERE p.Status = 'pending'",
+        2: "WHERE p.Status = 'checking'",
+        3: "WHERE p.Status = 'done'",
+        4: "WHERE p.Status = 'rejected'",
     }[status_idx]
 
     with get_db() as db:
         rows = db.execute(
             f"""
-            SELECT p.ID, p.URL, a.Name, p.HumanChecked, p.Rejected,
+            SELECT p.ID, p.URL, p.Status, a.Name,
                    r.BotWords, r.HumanWords, r.HumanErrors
             FROM posts_info p
             JOIN authors    a ON p.Author = a.ID
@@ -329,19 +353,13 @@ def view_all_posts():
 
     while True:
         header(f"📄 Посты — {status_opts[status_idx]} (последние {len(rows)})")
-        print(f"  {'#':<6} {'Автор':<22} {'Статус':<12} {'Бот сл':>6} {'Чел сл':>7} {'Ош':>4}")
+        print(f"  {'#':<6} {'Автор':<22} {'Статус':<14} {'Бот сл':>6} {'Чел сл':>7} {'Ош':>4}")
         hr()
         for r in rows:
-            if r["Rejected"]:
-                status = f"{R}отклонён{RESET}"
-            elif r["HumanChecked"]:
-                status = f"{G}проверен{RESET}"
-            else:
-                status = f"{Y}в очереди{RESET}"
-            bot_w = str(r["BotWords"]   or "—")
-            hum_w = str(r["HumanWords"] or "—")
+            bot_w = str(r["BotWords"]    or "—")
+            hum_w = str(r["HumanWords"]  or "—")
             hum_e = str(r["HumanErrors"] or "—")
-            print(f"  {r['ID']:<6} {r['Name']:<22} {status:<20} {bot_w:>6} {hum_w:>7} {hum_e:>4}")
+            print(f"  {r['ID']:<6} {r['Name']:<22} {_status_label(r['Status']):<22} {bot_w:>6} {hum_w:>7} {hum_e:>4}")
 
         print()
         raw = input(f"  {W}ID поста для просмотра текста (0 — назад): {RESET}").strip()
@@ -353,7 +371,7 @@ def view_all_posts():
         with get_db() as db:
             post = db.execute(
                 """
-                SELECT p.ID, p.URL, p.Text, a.Name, p.HumanChecked, p.Rejected,
+                SELECT p.ID, p.URL, p.Text, p.Status, a.Name,
                        r.BotWords, r.HumanWords, r.HumanErrors, r.RejectReason
                 FROM posts_info p
                 JOIN authors    a ON p.Author = a.ID
@@ -369,12 +387,13 @@ def view_all_posts():
         header(f"📄 Пост #{post['ID']}")
         print(f"  {BOLD}Автор:{RESET}  {post['Name']}")
         print(f"  {BOLD}URL:{RESET}    {DIM}{post['URL']}{RESET}")
-        if post["Rejected"]:
-            print(f"  {BOLD}Статус:{RESET} {R}Отклонён{RESET}  |  Причина: {post['RejectReason'] or '—'}")
-        elif post["HumanChecked"]:
-            print(f"  {BOLD}Статус:{RESET} {G}Проверен{RESET}  |  Слов: {post['HumanWords']}  Ошибок: {post['HumanErrors']}")
+        print(f"  {BOLD}Статус:{RESET} {_status_label(post['Status'])}", end="")
+        if post["Status"] == "rejected":
+            print(f"  |  Причина: {post['RejectReason'] or '—'}")
+        elif post["Status"] == "done":
+            print(f"  |  Слов: {post['HumanWords']}  Ошибок: {post['HumanErrors']}")
         else:
-            print(f"  {BOLD}Статус:{RESET} {Y}В очереди{RESET}")
+            print()
         print(f"  {BOLD}Бот слов:{RESET} {post['BotWords'] or '—'}")
         hr()
         text = post["Text"] or f"{DIM}(текст отсутствует){RESET}"
@@ -384,26 +403,38 @@ def view_all_posts():
 
 
 def view_queue():
-    header("📋 Персональные очереди")
-    with get_db() as db:
-        reviewers = db.execute(
-            "SELECT TGID, Name FROM reviewers WHERE Verified=1 ORDER BY Name"
-        ).fetchall()
+    header("📋 Очереди жюри")
 
-    if not reviewers:
+    if not _QM:
+        print(f"  {R}queue_manager недоступен.{RESET}")
+        pause()
+        return
+
+    sizes = get_all_reviewer_queue_sizes()
+    if not sizes:
         print(f"  {R}Нет верифицированных жюри.{RESET}")
         pause()
         return
 
     total = 0
-    for rv in reviewers:
-        count = get_queue_count(rv["TGID"]) if _QM else 0
+    for rv in sizes:
+        count = rv["count"]
         total += count
         bar = f"{B}{'█' * min(count, 20)}{RESET}" if count else f"{DIM}пусто{RESET}"
-        print(f"  {rv['Name']:<22} {bar} {count}")
+        print(f"  {rv['name']:<22} {bar} {count}")
 
     hr()
     print(f"  Всего в очередях: {total}")
+
+    # Свободные (Reviewer=NULL)
+    with get_db() as db:
+        free = db.execute(
+            "SELECT COUNT(*) FROM queue q JOIN posts_info p ON q.Post=p.ID "
+            "WHERE q.Reviewer IS NULL AND p.Status='pending'"
+        ).fetchone()[0]
+    if free:
+        print(f"  {DIM}Свободных (без жюри): {free}{RESET}")
+
     pause()
 
 
@@ -413,11 +444,11 @@ def find_post():
     with get_db() as db:
         rows = db.execute(
             """
-            SELECT p.ID, p.URL, a.Name, p.HumanChecked, p.Rejected, r.BotWords
+            SELECT p.ID, p.URL, p.Status, a.Name, r.BotWords
             FROM posts_info p
             JOIN authors    a ON p.Author = a.ID
             LEFT JOIN results r ON r.Post = p.ID
-            WHERE p.URL LIKE ? AND p.PostOfReviewer=0
+            WHERE p.URL LIKE ?
             LIMIT 10
             """,
             (f"%{url}%",),
@@ -427,14 +458,9 @@ def find_post():
         print(f"  {R}Не найдено.{RESET}")
     else:
         for r in rows:
-            status = (
-                f"{G}✅ проверен{RESET}"   if r["HumanChecked"] else
-                f"{R}❌ отклонён{RESET}"   if r["Rejected"]     else
-                f"{Y}⏳ в очереди{RESET}"
-            )
             print(f"\n  {BOLD}#{r['ID']}{RESET} {r['Name']}")
             print(f"  {DIM}{r['URL']}{RESET}")
-            print(f"  Статус: {status}  |  Бот: {r['BotWords'] or '—'} слов")
+            print(f"  Статус: {_status_label(r['Status'])}  |  Бот: {r['BotWords'] or '—'} слов")
     pause()
 
 
@@ -446,12 +472,12 @@ def find_post_by_author():
     with get_db() as db:
         rows = db.execute(
             """
-            SELECT p.ID, p.URL, a.Name, p.HumanChecked, p.Rejected,
+            SELECT p.ID, p.URL, p.Status, a.Name,
                    r.BotWords, r.HumanWords, r.HumanErrors
             FROM posts_info p
             JOIN authors    a ON p.Author = a.ID
             LEFT JOIN results r ON r.Post = p.ID
-            WHERE a.Name LIKE ? AND p.PostOfReviewer=0
+            WHERE a.Name LIKE ?
             ORDER BY p.ID DESC
             LIMIT 20
             """,
@@ -462,34 +488,30 @@ def find_post_by_author():
         print(f"  {R}Не найдено.{RESET}"); pause(); return
 
     header(f"🔍 Посты «{name}» ({len(rows)} шт.)")
-    print(f"  {'#':<6} {'Автор':<22} {'Статус':<12} {'Бот сл':>6} {'Чел сл':>7} {'Ош':>4}")
+    print(f"  {'#':<6} {'Автор':<22} {'Статус':<14} {'Бот сл':>6} {'Чел сл':>7} {'Ош':>4}")
     hr()
     for r in rows:
-        if r["Rejected"]:
-            status = f"{R}отклонён{RESET}"
-        elif r["HumanChecked"]:
-            status = f"{G}проверен{RESET}"
-        else:
-            status = f"{Y}в очереди{RESET}"
         print(
-            f"  {r['ID']:<6} {r['Name']:<22} {status:<20} "
+            f"  {r['ID']:<6} {r['Name']:<22} {_status_label(r['Status']):<22} "
             f"{str(r['BotWords'] or '—'):>6} {str(r['HumanWords'] or '—'):>7} {str(r['HumanErrors'] or '—'):>4}"
         )
     pause()
 
 
 def release_stuck():
+    """Сбрасывает посты со статусом 'checking', у которых жюри не закончил проверку."""
     header("🔓 Сброс зависших постов")
     with get_db() as db:
         rows = db.execute(
             """
-            SELECT r.ID as result_id, p.ID as post_id, p.URL, a.Name as author,
-                   rv.Name as reviewer
-            FROM results r
-            JOIN posts_info p ON r.Post = p.ID
-            JOIN authors    a ON p.Author = a.ID
-            LEFT JOIN reviewers rv ON rv.TGID = r.Reviewer
-            WHERE r.Reviewer IS NOT NULL AND r.HumanWords IS NULL AND p.Rejected=0
+            SELECT q.Post, p.URL, a.Name AS author,
+                   rv.Name AS reviewer, q.TakenAt
+            FROM queue q
+            JOIN posts_info p  ON q.Post     = p.ID
+            JOIN authors    a  ON p.Author   = a.ID
+            LEFT JOIN reviewers rv ON rv.TGID = q.Reviewer
+            WHERE q.TakenAt IS NOT NULL
+              AND p.Status = 'checking'
             """
         ).fetchall()
 
@@ -497,21 +519,27 @@ def release_stuck():
         print(f"  {G}Зависших постов нет!{RESET}"); pause(); return
 
     print(f"  {Y}Найдено: {len(rows)}{RESET}\n")
-    print(f"  {'#':<6} {'Автор поста':<22} {'Взял жюри':<20}  URL")
+    print(f"  {'#':<6} {'Автор поста':<22} {'Взял жюри':<20}  Взято в")
     hr()
     for r in rows:
-        reviewer  = r["reviewer"] or f"tgID:{r['result_id']}"
+        reviewer  = r["reviewer"] or "—"
         url_short = (r["URL"] or "")[-45:]
-        print(f"  {r['post_id']:<6} {r['author']:<22} {reviewer:<20}  {DIM}{url_short}{RESET}")
+        print(f"  {r['Post']:<6} {r['author']:<22} {reviewer:<20}  {r['TakenAt']}")
 
     print()
     if not confirm(f"Освободить все {len(rows)} зависших постов?"):
         return
 
     with get_db() as db:
-        db.execute(
-            "UPDATE results SET Reviewer=NULL WHERE Reviewer IS NOT NULL AND HumanWords IS NULL"
-        )
+        for r in rows:
+            db.execute(
+                "UPDATE queue SET Reviewer=NULL, TakenAt=NULL WHERE Post=?",
+                (r["Post"],),
+            )
+            db.execute(
+                "UPDATE posts_info SET Status='pending' WHERE ID=?",
+                (r["Post"],),
+            )
         db.commit()
 
     print(f"\n{G}  ✅ Освобождено {len(rows)} постов.{RESET}")
@@ -526,22 +554,31 @@ def reset_post():
 
     pid = int(raw)
     with get_db() as db:
-        row = db.execute("SELECT URL FROM posts_info WHERE ID=?", (pid,)).fetchone()
+        row = db.execute("SELECT URL, Status FROM posts_info WHERE ID=?", (pid,)).fetchone()
         if not row:
             print(f"{R}  Пост #{pid} не найден.{RESET}"); pause(); return
-        if not confirm(f"Сбросить проверку поста #{pid}?"):
+        if not confirm(f"Сбросить проверку поста #{pid} (статус: {row['Status']})?"):
             return
+        # Возвращаем в очередь
         db.execute(
-            "UPDATE posts_info SET HumanChecked=0, Rejected=0 WHERE ID=?", (pid,)
+            "UPDATE posts_info SET Status='pending' WHERE ID=?", (pid,)
+        )
+        db.execute(
+            "UPDATE queue SET Reviewer=NULL, TakenAt=NULL WHERE Post=?", (pid,)
         )
         db.execute(
             "UPDATE results SET HumanWords=NULL, HumanErrors=NULL, Reviewer=NULL, "
-            "SkipReason=NULL, RejectReason=NULL WHERE Post=?",
+            "RejectReason=NULL WHERE Post=?",
             (pid,),
         )
         db.commit()
+
+    # Если поста не было в очереди — добавляем
     if _QM:
-        assign_post(pid)
+        with get_db() as db:
+            in_queue = db.execute("SELECT 1 FROM queue WHERE Post=?", (pid,)).fetchone()
+        if not in_queue:
+            assign_post(pid)
 
     print(f"\n{G}  ✅ Пост #{pid} сброшен и возвращён в очередь.{RESET}")
     pause()
@@ -563,7 +600,7 @@ def reject_post_cli():
         if not confirm(f"Отклонить пост #{pid}?"):
             return
         db.execute(
-            "UPDATE posts_info SET Rejected=1, HumanChecked=1 WHERE ID=?", (pid,)
+            "UPDATE posts_info SET Status='rejected' WHERE ID=?", (pid,)
         )
         exists = db.execute("SELECT ID FROM results WHERE Post=?", (pid,)).fetchone()
         if exists:
@@ -576,8 +613,9 @@ def reject_post_cli():
                 "INSERT INTO results (Post, RejectReason) VALUES (?, ?)", (pid, reason)
             )
         db.commit()
+
     if _QM:
-        remove_from_all_queues(pid)
+        remove_post(pid)
 
     print(f"\n{G}  ✅ Пост #{pid} отклонён.{RESET}")
     pause()
@@ -592,7 +630,7 @@ def restore_post():
             FROM posts_info p
             JOIN authors    a ON p.Author = a.ID
             LEFT JOIN results r ON r.Post = p.ID
-            WHERE p.Rejected=1 AND p.PostOfReviewer=0
+            WHERE p.Status = 'rejected'
             ORDER BY p.ID DESC
             LIMIT 20
             """
@@ -609,7 +647,7 @@ def restore_post():
     pid = rows[idx]["ID"]
     with get_db() as db:
         db.execute(
-            "UPDATE posts_info SET Rejected=0, HumanChecked=0 WHERE ID=?", (pid,)
+            "UPDATE posts_info SET Status='pending' WHERE ID=?", (pid,)
         )
         db.execute(
             "UPDATE results SET HumanWords=NULL, HumanErrors=NULL, Reviewer=NULL, "
@@ -617,8 +655,12 @@ def restore_post():
             (pid,),
         )
         db.commit()
+
     if _QM:
-        assign_post(pid)
+        with get_db() as db:
+            in_queue = db.execute("SELECT 1 FROM queue WHERE Post=?", (pid,)).fetchone()
+        if not in_queue:
+            assign_post(pid)
 
     print(f"\n{G}  ✅ Пост #{pid} восстановлен и возвращён в очередь.{RESET}")
     pause()
@@ -628,17 +670,56 @@ def clear_queue():
     header("🗑  Очистить все очереди")
     total = get_total_queue_count() if _QM else 0
 
-    if not confirm(f"Удалить ВСЕ {total} постов из персональных очередей? (посты останутся в posts_info)"):
+    if not confirm(f"Удалить ВСЕ {total} постов из очереди? (посты останутся в posts_info со статусом pending)"):
         return
 
     with get_db() as db:
-        rows = db.execute("SELECT TGID FROM reviewers WHERE Verified=1").fetchall()
-        for r in rows:
-            table = f"queue_{r['TGID']}"
-            db.execute(f"DELETE FROM {table}")
+        db.execute("UPDATE posts_info SET Status='pending' WHERE Status IN ('checking', 'pending')")
+        db.execute("DELETE FROM queue")
         db.commit()
 
     print(f"\n{G}  ✅ Все очереди очищены.{RESET}")
+    pause()
+
+
+def reassign_queue():
+    """Очищает очередь и переназначает все pending/checking посты заново."""
+    header("🔄 Переназначить очередь")
+
+    with get_db() as db:
+        post_count = db.execute(
+            "SELECT COUNT(*) FROM posts_info WHERE Status IN ('pending', 'checking')"
+        ).fetchone()[0]
+
+    print(f"  Непроверенных постов: {BOLD}{post_count}{RESET}")
+    print()
+    print(f"  {Y}Что произойдёт:{RESET}")
+    print(f"  1. Текущая очередь будет очищена")
+    print(f"  2. Все {post_count} постов будут распределены заново по текущему QUEUE_MODE")
+    print()
+
+    if not confirm(f"Переназначить все {post_count} постов?"):
+        return
+
+    with get_db() as db:
+        db.execute("UPDATE posts_info SET Status='pending' WHERE Status='checking'")
+        db.execute("DELETE FROM queue")
+        db.commit()
+        posts = db.execute(
+            "SELECT ID FROM posts_info WHERE Status='pending' ORDER BY ID"
+        ).fetchall()
+
+    if not _QM:
+        print(f"  {R}queue_manager недоступен.{RESET}")
+        pause()
+        return
+
+    ok = 0
+    for p in posts:
+        assign_post(p["ID"])
+        ok += 1
+
+    print(f"\n{G}  ✅ Переназначено: {ok} из {len(posts)} постов.{RESET}")
     pause()
 
 
@@ -677,7 +758,11 @@ def list_days():
 
 def create_day():
     header("➕ Создать новый день")
-    today = datetime.now().strftime("%d.%m.%Y")
+    try:
+        from pytz import timezone as _tz
+        today = datetime.now(_tz("Europe/Moscow")).strftime("%d.%m.%Y")
+    except ImportError:
+        today = datetime.now().strftime("%d.%m.%Y")
     label = input(f"  Название/дата [{today}]: {W}").strip(); print(RESET, end="")
     if not label:
         label = today
@@ -724,7 +809,6 @@ def delete_day():
     day_id   = rows[idx]["Day"]
     day_data = rows[idx]["Data"]
 
-    # Проверяем есть ли посты привязанные к этому дню
     with get_db() as db:
         post_count = db.execute(
             "SELECT COUNT(*) FROM posts_info WHERE Day = ?", (day_id,)
@@ -733,20 +817,16 @@ def delete_day():
     target_day = None
     if post_count > 0:
         print(f"\n  {Y}⚠  К этому дню привязано {post_count} постов.{RESET}")
-
-        # Выбираем куда перенести посты
         other_rows = [r for r in rows if r["Day"] != day_id]
         if not other_rows:
             print(f"  {R}Нет других дней для переноса постов.{RESET}")
             pause()
             return
-
         other_opts = [f"День {r['Day']}: {r['Data']}" for r in other_rows]
         print()
         target_idx = menu("Куда перенести посты?", other_opts)
         if target_idx == -1:
             return
-
         target_day      = other_rows[target_idx]["Day"]
         target_day_data = other_rows[target_idx]["Data"]
         print(f"\n  Посты будут перенесены в День {target_day} ({target_day_data})")
@@ -916,8 +996,6 @@ def remove_from_blacklist():
 
 def view_logs():
     header("📄 Просмотр логов")
-
-    # Берём самый свежий лог файл
     logs_dir = ROOT / "logs"
     if not logs_dir.exists():
         print(f"  {R}Папка логов не найдена.{RESET}"); pause(); return
@@ -927,7 +1005,6 @@ def view_logs():
         print(f"  {R}Лог файлы не найдены.{RESET}"); pause(); return
 
     log_file = log_files[0]
-
     counts = [50, 100, 200]
     idx    = menu(f"Файл: {log_file.name}\nСколько строк показать?", ["50 строк", "100 строк", "200 строк"])
     if idx == -1:
@@ -963,8 +1040,8 @@ def full_reset():
     header("🗑  Полная очистка данных")
 
     TABLES = [
+        ("queue",      "Очередь"),
         ("results",    "Результаты"),
-        # queue — заменена персональными очередями queue_{TGID}
         ("posts_info", "Посты"),
         ("links",      "Ссылки"),
         ("authors",    "Авторы"),

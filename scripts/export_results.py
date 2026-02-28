@@ -142,6 +142,28 @@ def _get_summary_by_day(conn):
     ).fetchall()
 
 
+def _get_top_authors(conn):
+    """Все участники отсортированные по ошибкам на 1000 слов (по возрастанию)."""
+    return conn.execute(
+        """
+        SELECT
+            a.Name                                          AS author,
+            COUNT(p.ID)                                     AS post_count,
+            COALESCE(SUM(r.HumanWords), 0)                 AS words,
+            COALESCE(SUM(r.HumanErrors), 0)                AS errors
+        FROM posts_info p
+        JOIN authors  a ON p.Author = a.ID
+        JOIN results  r ON r.Post   = p.ID
+        WHERE p.Rejected      = 0
+          AND p.PostOfReviewer = 0
+          AND r.HumanWords    IS NOT NULL
+        GROUP BY a.ID
+        HAVING words > 0
+        ORDER BY errors * 1.0 / words ASC
+        """
+    ).fetchall()
+
+
 def _get_reviewer_stats(conn):
     return conn.execute(
         """
@@ -237,12 +259,43 @@ def _build_summary_sheet(ws, conn):
             ws.cell(row=r2, column=c).value = v
         _data_row(ws, r2, 5, even=(i % 2 == 0))
 
-    ws.column_dimensions["A"].width = 18
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 16
-    ws.column_dimensions["D"].width = 14
-    ws.column_dimensions["E"].width = 22
-    ws.column_dimensions["F"].width = 4
+    # ── Топ участников ────────────────────────────────────────────────────────
+    r3 = r2 + 2
+    ws.merge_cells(f"A{r3}:F{r3}")
+    ws[f"A{r3}"].value     = "ТОП УЧАСТНИКОВ — меньше всего ошибок на 1000 слов"
+    ws[f"A{r3}"].font      = _font(11, bold=True, color=CLR_LIGHT)
+    ws[f"A{r3}"].fill      = _fill(CLR_ACCENT)
+    ws[f"A{r3}"].alignment = _align("center")
+    ws.row_dimensions[r3].height = 24
+
+    r3 += 1
+    top_headers = ["#", "Участник", "Постов", "Слов", "Ошибок", "Ошибок / 1000 слов"]
+    for c, h in enumerate(top_headers, 1):
+        ws.cell(row=r3, column=c).value = h
+    _header_row(ws, r3, 6)
+
+    top_authors = _get_top_authors(conn)
+    for i, a in enumerate(top_authors, 1):
+        r3 += 1
+        ep1k = f"=IFERROR(ROUND(E{r3}/D{r3}*1000,1),0)"
+        vals = [i, a["author"], a["post_count"], a["words"], a["errors"], ep1k]
+        for c, v in enumerate(vals, 1):
+            ws.cell(row=r3, column=c).value = v
+        _data_row(ws, r3, 6, even=(i % 2 == 0))
+        # Медали для первых трёх
+        if i == 1:
+            ws.cell(row=r3, column=1).value = "🥇"
+        elif i == 2:
+            ws.cell(row=r3, column=1).value = "🥈"
+        elif i == 3:
+            ws.cell(row=r3, column=1).value = "🥉"
+
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 10
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 12
+    ws.column_dimensions["F"].width = 22
 
 
 # ── Лист: День ────────────────────────────────────────────────────────────────

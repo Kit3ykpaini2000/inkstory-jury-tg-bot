@@ -1,13 +1,12 @@
 """
-posts.py — парсинг постов через requests + BeautifulSoup
+parser/posts.py — парсинг постов через requests + BeautifulSoup
 
 Логика:
-1. Берём ссылки с Parsed = 0 из таблицы links
-2. Для каждой ссылки загружаем страницу и извлекаем автора и текст
-3. Считаем слова ботом
-4. Если автор — верифицированный жюри, сохраняем с PostOfReviewer=1 без очереди
-5. Иначе сохраняем пост в posts_info, results и распределяем в очередь через queue_manager
-6. Помечаем ссылку как обработанную (Parsed = 1) только после успешного сохранения
+1. Берём ссылки с Parsed=0 из таблицы links
+2. Загружаем страницу, извлекаем автора и текст
+3. Если автор — верифицированный жюри → Status='reviewer_post', в очередь не идёт
+4. Иначе → Status='pending', добавляем в queue через assign_post()
+5. Помечаем ссылку Parsed=1 только после успешного сохранения
 """
 
 import time
@@ -15,13 +14,12 @@ import requests
 from bs4 import BeautifulSoup
 
 from utils.database import get_db
+from utils.config import PAGE_PAUSE_POSTS
 from utils.logger import setup_logger
 from utils.word_counter import count_words
-from parser.queue_manager import assign_post, ensure_all_queues
+from parser.queue_manager import assign_post
 
 log = setup_logger()
-
-PAGE_PAUSE = 1.5  # секунды между запросами
 
 HEADERS = {
     "User-Agent": (
@@ -33,38 +31,32 @@ HEADERS = {
 }
 
 
-# ── БД ────────────────────────────────────────────────────────────────────────
-
 def _get_unparsed_links() -> list[str]:
-    """Возвращает ссылки с Parsed = 0."""
     with get_db() as db:
-        rows = db.execute("SELECT URL FROM links WHERE Parsed = 0").fetchall()
-        return [row["URL"] for row in rows]
+        return [r["URL"] for r in db.execute(
+            "SELECT URL FROM links WHERE Parsed=0"
+        ).fetchall()]
 
 
 def _get_verified_reviewer_urls() -> set[str]:
-    """Возвращает URL профилей жюри с Verified = 1."""
     with get_db() as db:
-        rows = db.execute(
-            "SELECT URL FROM reviewers WHERE Verified = 1"
-        ).fetchall()
-        return {row["URL"] for row in rows}
+        return {r["URL"] for r in db.execute(
+            "SELECT URL FROM reviewers WHERE Verified=1"
+        ).fetchall()}
 
 
 def _get_current_day() -> int | None:
-    """Возвращает ID текущего (последнего) дня конкурса."""
     with get_db() as db:
         row = db.execute("SELECT MAX(Day) FROM days").fetchone()
         return row[0] if row and row[0] else None
 
 
 def _mark_links_parsed(urls: list[str]) -> None:
-    """Помечает пачку ссылок как обработанные одной транзакцией."""
     if not urls:
         return
     with get_db() as db:
         db.executemany(
-            "UPDATE links SET Parsed = 1 WHERE URL = ?",
+            "UPDATE links SET Parsed=1 WHERE URL=?",
             [(url,) for url in urls],
         )
         db.commit()
@@ -80,45 +72,47 @@ def _save_post(
     is_reviewer: bool,
 ) -> int | None:
     """
-    Сохраняет пост в posts_info атомарно.
-    Если автор — жюри, ставит PostOfReviewer = 1 и не создаёт записи в results и queue.
-    Возвращает post_id или None если пост жюри / ошибка.
+    Сохраняет пост атомарно.
+    Возвращает post_id для постов участников или None для постов жюри/ошибки.
     """
+    status = "reviewer_post" if is_reviewer else "pending"
+
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
         try:
-            # Автор — добавляем если не существует
-            row = db.execute("SELECT ID FROM authors WHERE URL = ?", (author_url,)).fetchone()
+            # Автор
+            row = db.execute(
+                "SELECT ID FROM authors WHERE URL=?", (author_url,)
+            ).fetchone()
             if row:
                 author_id = row["ID"]
             else:
-                cursor = db.execute(
-                    "INSERT INTO authors (Name, URL) VALUES (?, ?)",
+                cur = db.execute(
+                    "INSERT INTO authors (Name, URL) VALUES (?,?)",
                     (author_name, author_url),
                 )
-                author_id = cursor.lastrowid
-
-            post_of_reviewer = 1 if is_reviewer else 0
+                author_id = cur.lastrowid
 
             # Пост
-            cursor = db.execute(
+            cur = db.execute(
                 """
-                INSERT OR IGNORE INTO posts_info
-                    (Author, URL, Text, Day, HumanChecked, PostOfReviewer, Rejected)
-                VALUES (?, ?, ?, ?, 0, ?, 0)
+                INSERT OR IGNORE INTO posts_info (Author, URL, Text, Day, Status)
+                VALUES (?,?,?,?,?)
                 """,
-                (author_id, url, text, day, post_of_reviewer),
+                (author_id, url, text, day, status),
             )
-            post_id = cursor.lastrowid
+            post_id = cur.lastrowid
 
-            # Если пост уже существовал — получаем его ID
             if not post_id:
-                row = db.execute("SELECT ID FROM posts_info WHERE URL = ?", (url,)).fetchone()
+                row = db.execute(
+                    "SELECT ID FROM posts_info WHERE URL=?", (url,)
+                ).fetchone()
                 post_id = row["ID"] if row else None
 
+            # results создаём только для постов участников
             if post_id and not is_reviewer:
                 db.execute(
-                    "INSERT OR IGNORE INTO results (Post, BotWords) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO results (Post, BotWords) VALUES (?,?)",
                     (post_id, bot_words),
                 )
 
@@ -127,44 +121,38 @@ def _save_post(
 
         except Exception as e:
             db.execute("ROLLBACK")
-            log.error(f"[posts] Ошибка сохранения поста {url}: {e}")
+            log.error(f"[posts] Ошибка сохранения {url}: {e}")
             return None
 
 
-# ── Парсинг страницы ──────────────────────────────────────────────────────────
-
 def _parse_page(url: str) -> dict | None:
-    """
-    Загружает страницу поста и извлекает автора и текст.
-    Возвращает None если не удалось получить данные.
-    """
+    """Загружает страницу и извлекает автора и текст. None при ошибке."""
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        response.encoding = "utf-8"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
     except requests.RequestException as e:
         log.error(f"[posts] Ошибка запроса {url}: {e}")
         return None
 
     try:
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Автор — первая ссылка на /user/ с непустым текстом
-        author_name = ""
-        author_url  = ""
+        author_name = author_url = ""
         for a in soup.select("a[href*='/user/']"):
             name = a.get_text(strip=True)
             if name:
                 author_name = name
                 href = a.get("href", "")
-                author_url = f"https://inkstory.net{href}" if href.startswith("/") else href
+                author_url = (
+                    f"https://inkstory.net{href}" if href.startswith("/") else href
+                )
                 break
 
         if not author_name:
             log.warning(f"[posts] Не найден автор: {url}")
             return None
 
-        # Текст поста — перебираем селекторы от точного к общему
         text = ""
         for selector in [
             "div.prose.prose-sm p.max-w-full",
@@ -180,34 +168,20 @@ def _parse_page(url: str) -> dict | None:
                     break
 
         if not text:
-            log.warning(f"[posts] Не удалось найти текст: {url}")
+            log.warning(f"[posts] Не найден текст: {url}")
 
-        return {
-            "author_name": author_name,
-            "author_url":  author_url,
-            "text":        text,
-        }
+        return {"author_name": author_name, "author_url": author_url, "text": text}
 
     except Exception as e:
         log.error(f"[posts] Ошибка парсинга {url}: {e}")
         return None
 
 
-# ── Основная функция ──────────────────────────────────────────────────────────
-
 def parse() -> dict[str, int]:
     """
-    Парсит все ссылки с Parsed = 0 и сохраняет посты в БД.
-
-    Транзакционность:
-    - Ссылка помечается Parsed = 1 только если пост успешно сохранён
-    - При ошибке сохранения ссылка остаётся Parsed = 0 и будет обработана при следующем запуске
-    - В конце все успешно обработанные ссылки фиксируются одной транзакцией
-
-    Возвращает dict {tgid: количество_постов}.
+    Парсит все ссылки с Parsed=0 и сохраняет посты в БД.
+    Возвращает dict {tgid: количество_новых_постов} для уведомлений.
     """
-    ensure_all_queues()
-
     day = _get_current_day()
     if not day:
         log.error("[posts] Нет активного дня в таблице days")
@@ -215,8 +189,8 @@ def parse() -> dict[str, int]:
 
     links                  = _get_unparsed_links()
     verified_reviewer_urls = _get_verified_reviewer_urls()
-    assigned: dict[str, int] = {}   # tgid → количество постов
-    parsed_urls: list[str]   = []   # ссылки успешно обработанные — пометим в конце
+    assigned: dict[str, int] = {}
+    parsed_urls: list[str]   = []
 
     log.info(f"[posts] Ссылок для парсинга: {len(links)}, день: {day}")
 
@@ -226,8 +200,7 @@ def parse() -> dict[str, int]:
         post = _parse_page(url)
 
         if not post:
-            # Не удалось загрузить/распарсить страницу — помечаем как обработанную
-            # чтобы не зациклиться, но пост не сохраняем
+            # Не удалось спарсить — помечаем чтобы не зациклиться
             parsed_urls.append(url)
             continue
 
@@ -235,7 +208,7 @@ def parse() -> dict[str, int]:
         bot_words   = count_words(post["text"])
 
         if is_reviewer:
-            log.info(f"[posts] Пост жюри — без очереди: {post['author_name']} — {url}")
+            log.info(f"[posts] Пост жюри — пропускаем очередь: {post['author_name']}")
 
         post_id = _save_post(
             url=url,
@@ -248,8 +221,7 @@ def parse() -> dict[str, int]:
         )
 
         if post_id is None and not is_reviewer:
-            # Ошибка сохранения — не помечаем ссылку, попробуем в следующий раз
-            log.warning(f"[posts] Не удалось сохранить пост, пропускаем: {url}")
+            log.warning(f"[posts] Не удалось сохранить пост: {url}")
             continue
 
         log.info(f"[posts] Сохранён: {post['author_name']} — {url} ({bot_words} слов)")
@@ -260,12 +232,8 @@ def parse() -> dict[str, int]:
             if tgid:
                 assigned[tgid] = assigned.get(tgid, 0) + 1
 
-        time.sleep(PAGE_PAUSE)
+        time.sleep(PAGE_PAUSE_POSTS)
 
-    # Фиксируем все успешно обработанные ссылки одной транзакцией
     _mark_links_parsed(parsed_urls)
-    log.info(f"[posts] Помечено Parsed=1: {len(parsed_urls)} ссылок")
-
-    total = sum(assigned.values())
-    log.info(f"[posts] Готово. Новых постов в очереди: {total}")
+    log.info(f"[posts] Помечено Parsed=1: {len(parsed_urls)}, новых в очереди: {sum(assigned.values())}")
     return assigned
