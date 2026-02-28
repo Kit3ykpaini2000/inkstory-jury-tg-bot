@@ -5,7 +5,7 @@ export_results.py — экспорт итогов конкурса в Excel
 - Лист "Общий отчёт" — сводка по всем дням + статистика жюри
 - Лист "ДД.ММ", "ДД.ММ", ... — принятые посты по каждому дню
 
-Только принятые посты: HumanWords IS NOT NULL AND Rejected = 0
+Только принятые посты: HumanWords IS NOT NULL AND Status = 'done'
 
 Запуск: python scripts/export_results.py
 """
@@ -114,10 +114,9 @@ def _get_posts_by_day(conn, day_id):
         FROM posts_info p
         JOIN authors  a ON p.Author   = a.ID
         JOIN results  r ON r.Post     = p.ID
-        WHERE p.Day          = ?
-          AND p.Rejected      = 0
-          AND p.PostOfReviewer = 0
-          AND r.HumanWords   IS NOT NULL
+        WHERE p.Day        = ?
+          AND p.Status     = 'done'
+          AND r.HumanWords IS NOT NULL
         GROUP BY a.ID
         ORDER BY errors * 1.0 / NULLIF(words, 0) ASC
         """,
@@ -135,7 +134,7 @@ def _get_summary_by_day(conn):
             COALESCE(SUM(r.HumanErrors), 0)               AS errors
         FROM days d
         LEFT JOIN posts_info p ON p.Day = d.Day
-            AND p.Rejected = 0 AND p.PostOfReviewer = 0
+            AND p.Status = 'done'
         LEFT JOIN results r ON r.Post = p.ID AND r.HumanWords IS NOT NULL
         GROUP BY d.Day ORDER BY d.Day
         """
@@ -154,9 +153,8 @@ def _get_top_authors(conn):
         FROM posts_info p
         JOIN authors  a ON p.Author = a.ID
         JOIN results  r ON r.Post   = p.ID
-        WHERE p.Rejected      = 0
-          AND p.PostOfReviewer = 0
-          AND r.HumanWords    IS NOT NULL
+        WHERE p.Status     = 'done'
+          AND r.HumanWords IS NOT NULL
         GROUP BY a.ID
         HAVING words > 0
         ORDER BY errors * 1.0 / words ASC
