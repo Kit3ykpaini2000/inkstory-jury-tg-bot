@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 > nul
-cd /d %~dp0
+
+:: Переходим в корень проекта (папка выше deploy/)
+cd /d %~dp0..
 
 echo [InkStory Bot]
 

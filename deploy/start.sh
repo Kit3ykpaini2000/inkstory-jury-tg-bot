@@ -1,5 +1,7 @@
 #!/bin/bash
-cd "$(dirname "$0")"
+
+# Переходим в корень проекта (папка выше deploy/)
+cd "$(dirname "$0")/.."
 
 echo "[InkStory Bot]"
 
