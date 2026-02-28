@@ -90,6 +90,40 @@ python main.py
 python scripts/export_results.py
 ```
 
+## Развёртывание
+
+Все файлы для запуска находятся в папке `deploy/`.
+
+### Linux / Raspberry Pi
+
+```bash
+bash deploy/start.sh
+```
+
+Для запуска как systemd-сервис (автозапуск при перезагрузке):
+
+```bash
+# Отредактируй deploy/inkstory.service — замени YOUR_USER и путь к проекту
+sudo cp deploy/inkstory.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable inkstory
+sudo systemctl start inkstory
+
+# Статус и логи
+sudo systemctl status inkstory
+journalctl -u inkstory -f
+```
+
+### Windows
+
+```bat
+# С консольным окном
+deploy\start.bat
+
+# Без консольного окна (двойной клик)
+deploy\start_silent.vbs
+```
+
 ## Структура проекта
 
 ```
@@ -116,6 +150,11 @@ inkstory_parser/
 │   ├── export_results.py   # Экспорт итогов в Excel
 │   ├── migrate.py          # Миграция БД между версиями
 │   └── fix_pending_queue.py # Восстановление pending-постов без очереди
+├── deploy/
+│   ├── inkstory.service    # Systemd-сервис для Linux/Raspberry Pi
+│   ├── start.sh            # Запуск на Linux/macOS
+│   ├── start.bat           # Запуск на Windows
+│   └── start_silent.vbs    # Запуск на Windows без консольного окна
 ├── data/
 │   └── main.db.example     # Пример структуры БД
 ├── results/                # Папка для Excel-отчётов (генерируется автоматически)
