@@ -173,12 +173,6 @@ python scripts/fix_pending_queue.py --db data/backup.db
 
 ## Changelog
 
-### v1.3
-- Два режима очереди: `distributed` и `open` (переключается через `QUEUE_MODE` в `.env`)
-- Автоматическое освобождение просроченных постов (`EXPIRE_MINUTES`)
-- Добавлен `scripts/fix_pending_queue.py` — восстановление pending-постов без записи в очереди
-- Добавлен `utils/config.py` — централизованное хранение всех настроек из `.env`
-
 ### v1.2
 - Экспорт итогов конкурса в Excel (`scripts/export_results.py`)
 - Папка `results/` для хранения отчётов
