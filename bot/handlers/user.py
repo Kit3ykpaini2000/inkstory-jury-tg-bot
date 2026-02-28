@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 from utils.database import get_db
 from utils.ai_utils import check_post
-from parser.queue_manager import get_queue_posts, remove_from_queue, remove_from_all_queues
+from parser.queue_manager import get_queue_posts, remove_from_queue, remove_from_all_queues, get_free_posts, assign_post
 from utils.logger import setup_logger
 from bot.keyboards import (
     review_keyboard,
@@ -71,51 +71,70 @@ def _register(tg_id: str, name: str, url: str) -> None:
         db.commit()
 
 
+def _try_reserve_post(post_id: int, tg_id: str, db) -> dict | None:
+    """Пытается атомарно зарезервировать пост за жюри. Возвращает данные или None."""
+    row = db.execute(
+        """
+        SELECT p.ID, p.URL, a.Name, r.BotWords, r.SkipReason, r.ID as result_id
+        FROM posts_info p
+        JOIN authors a ON p.Author = a.ID
+        JOIN results r ON r.Post = p.ID
+        WHERE p.ID = ?
+          AND p.HumanChecked  = 0
+          AND p.Rejected       = 0
+          AND p.PostOfReviewer = 0
+          AND r.Reviewer       IS NULL
+        """,
+        (post_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    updated = db.execute(
+        "UPDATE results SET Reviewer = ? WHERE ID = ? AND Reviewer IS NULL",
+        (tg_id, row["result_id"]),
+    ).rowcount
+
+    if not updated:
+        return None
+
+    return {
+        "post_id":   row["ID"],
+        "url":       row["URL"],
+        "author":    row["Name"],
+        "bot_words": row["BotWords"],
+        "prev_skip": row["SkipReason"],
+        "result_id": row["result_id"],
+    }
+
+
 def _get_next_post(tg_id: str) -> dict | None:
     """
-    Атомарно резервирует первый пост из личной очереди жюри.
+    Атомарно резервирует пост для жюри.
+    Сначала смотрит личную очередь жюри.
+    Если она пуста — берёт из свободных постов (просроченные у других жюри).
     """
+    # Сначала личная очередь
     post_ids = get_queue_posts(tg_id)
+
+    # Если пусто — смотрим свободные посты
     if not post_ids:
-        return None
+        post_ids = get_free_posts()
+        if not post_ids:
+            return None
+        # Назначаем первый свободный пост этому жюри
+        assign_post(post_ids[0])
+        post_ids = [post_ids[0]]
 
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
 
         for post_id in post_ids:
-            row = db.execute(
-                """
-                SELECT p.ID, p.URL, a.Name, r.BotWords, r.SkipReason, r.ID as result_id
-                FROM posts_info p
-                JOIN authors a ON p.Author = a.ID
-                JOIN results r ON r.Post = p.ID
-                WHERE p.ID = ?
-                  AND p.HumanChecked  = 0
-                  AND p.Rejected       = 0
-                  AND p.PostOfReviewer = 0
-                  AND r.Reviewer       IS NULL
-                """,
-                (post_id,),
-            ).fetchone()
-
-            if not row:
-                continue
-
-            updated = db.execute(
-                "UPDATE results SET Reviewer = ? WHERE ID = ? AND Reviewer IS NULL",
-                (tg_id, row["result_id"]),
-            ).rowcount
-
-            if updated:
+            result = _try_reserve_post(post_id, tg_id, db)
+            if result:
                 db.execute("COMMIT")
-                return {
-                    "post_id":   row["ID"],
-                    "url":       row["URL"],
-                    "author":    row["Name"],
-                    "bot_words": row["BotWords"],
-                    "prev_skip": row["SkipReason"],
-                    "result_id": row["result_id"],
-                }
+                return result
 
         db.execute("ROLLBACK")
         return None
@@ -485,7 +504,13 @@ async def cb_ai_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = check_post(row["Text"])
     for msg in results:
-        await query.message.reply_text(msg)
+        # Telegram лимит — 4096 символов. Нарезаем если длиннее
+        if len(msg) <= 4096:
+            await query.message.reply_text(msg)
+        else:
+            # Режем по 4000 символов с запасом
+            for i in range(0, len(msg), 4000):
+                await query.message.reply_text(msg[i:i+4000])
 
     return WAITING_WORDS
 

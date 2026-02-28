@@ -93,9 +93,6 @@ def menu(title: str, options: list, show_stats: bool = False) -> int:
 def _quick_stats() -> str:
     try:
         with get_db() as db:
-            in_queue = db.execute(
-0  # заменено queue_manager
-            ).fetchone()
             in_queue = 0  # подставляется ниже
             checked = db.execute(
                 "SELECT COUNT(*) FROM posts_info WHERE HumanChecked=1 AND Rejected=0"
@@ -280,7 +277,8 @@ def delete_reviewer():
 def manage_posts():
     actions = [
         view_all_posts, view_queue, find_post, find_post_by_author,
-        release_stuck, reset_post, reject_post_cli, restore_post, clear_queue,
+        release_stuck, reset_post, reject_post_cli, restore_post,
+        reassign_queue, clear_queue,
     ]
     while True:
         choice = menu("📝 Управление постами", [
@@ -292,7 +290,8 @@ def manage_posts():
             "Сбросить проверку поста",
             "Отклонить пост вручную",
             "Восстановить отклонённый пост",
-            "Очистить всю очередь",
+            "🔄 Переназначить очередь заново",
+            "🗑  Очистить всю очередь",
         ])
         if choice == -1:
             return
@@ -628,17 +627,56 @@ def clear_queue():
     header("🗑  Очистить все очереди")
     total = get_total_queue_count() if _QM else 0
 
-    if not confirm(f"Удалить ВСЕ {total} постов из персональных очередей? (посты останутся в posts_info)"):
+    if not confirm(f"Удалить ВСЕ {total} постов из очереди? (посты останутся в posts_info)"):
         return
 
     with get_db() as db:
-        rows = db.execute("SELECT TGID FROM reviewers WHERE Verified=1").fetchall()
-        for r in rows:
-            table = f"queue_{r['TGID']}"
-            db.execute(f"DELETE FROM {table}")
+        db.execute("DELETE FROM queue")
         db.commit()
 
     print(f"\n{G}  ✅ Все очереди очищены.{RESET}")
+    pause()
+
+
+def reassign_queue():
+    """Очищает очередь и переназначает все непроверенные посты заново."""
+    header("🔄 Переназначить очередь")
+
+    with get_db() as db:
+        post_count = db.execute(
+            "SELECT COUNT(*) FROM posts_info WHERE HumanChecked=0 AND Rejected=0 AND PostOfReviewer=0"
+        ).fetchone()[0]
+
+    print(f"  Непроверенных постов: {BOLD}{post_count}{RESET}")
+    print()
+    print(f"  {Y}Что произойдёт:{RESET}")
+    print(f"  1. Текущая очередь будет очищена")
+    print(f"  2. Все {post_count} постов будут распределены заново по новой логике")
+    print()
+
+    if not confirm(f"Переназначить все {post_count} постов?"):
+        return
+
+    with get_db() as db:
+        db.execute("DELETE FROM queue")
+        db.commit()
+        posts = db.execute(
+            "SELECT ID FROM posts_info WHERE HumanChecked=0 AND Rejected=0 AND PostOfReviewer=0 ORDER BY ID"
+        ).fetchall()
+
+    if not _QM:
+        print(f"  {R}queue_manager недоступен.{RESET}")
+        pause()
+        return
+
+    print()
+    ok = 0
+    for p in posts:
+        tgid = assign_post(p["ID"])
+        if tgid:
+            ok += 1
+
+    print(f"\n{G}  ✅ Переназначено: {ok} из {len(posts)} постов.{RESET}")
     pause()
 
 
@@ -677,7 +715,8 @@ def list_days():
 
 def create_day():
     header("➕ Создать новый день")
-    today = datetime.now().strftime("%d.%m.%Y")
+    from pytz import timezone as _tz
+    today = datetime.now(_tz("Europe/Moscow")).strftime("%d.%m.%Y")
     label = input(f"  Название/дата [{today}]: {W}").strip(); print(RESET, end="")
     if not label:
         label = today

@@ -76,8 +76,9 @@ CREATE TABLE IF NOT EXISTS results (
 
 -- Очередь жюри (единая таблица)
 CREATE TABLE IF NOT EXISTS queue (
-    Reviewer TEXT    NOT NULL REFERENCES reviewers(TGID),
-    Post     INTEGER NOT NULL REFERENCES posts_info(ID),
+    Reviewer   TEXT    NOT NULL REFERENCES reviewers(TGID),
+    Post       INTEGER NOT NULL REFERENCES posts_info(ID),
+    AssignedAt TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (Reviewer, Post)
 );
 
@@ -88,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_rejected    ON posts_info(Rejected);
 CREATE INDEX IF NOT EXISTS idx_results_reviewer  ON results(Reviewer);
 CREATE INDEX IF NOT EXISTS idx_queue_reviewer    ON queue(Reviewer);
 CREATE INDEX IF NOT EXISTS idx_queue_post        ON queue(Post);
+CREATE INDEX IF NOT EXISTS idx_queue_assignedat   ON queue(AssignedAt);
 """
 
 
