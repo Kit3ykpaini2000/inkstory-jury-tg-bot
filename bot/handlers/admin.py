@@ -202,10 +202,10 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=queue_mode_keyboard(mode),
         )
 
-    elif data in ("qmode_open", "qmode_distributed"):
+    elif data in ("qmode_open", "qmode_distributed", "qmode_balanced"):
         new_mode = data.replace("qmode_", "")
         await query.edit_message_text(
-            f"⚙️ Режим очереди нельзя изменить через бота.Измени QUEUE_MODE в файле .env и перезапусти бота.",
+            f"⚙️ Режим очереди нельзя изменить через бота.\n\nИзмени QUEUE_MODE в файле .env и перезапусти бота.\n\nТекущий режим: {QUEUE_MODE}",
             reply_markup=back_keyboard(),
         )
 

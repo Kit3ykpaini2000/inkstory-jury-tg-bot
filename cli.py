@@ -288,11 +288,103 @@ def delete_reviewer():
 # ПОСТЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
+def fix_pending_queue():
+    """Добавляет pending-посты без записи в queue с учётом QUEUE_MODE."""
+    from datetime import timezone
+    from utils.config import QUEUE_MODE
+
+    header("🔧 Восстановление очереди (fix_pending_queue)")
+
+    with get_db() as db:
+        orphans = db.execute(
+            """
+            SELECT p.ID, p.URL, a.Name AS author
+            FROM posts_info p
+            JOIN authors a ON p.Author = a.ID
+            WHERE p.Status = 'pending'
+              AND p.ID NOT IN (SELECT Post FROM queue)
+            ORDER BY p.ID
+            """
+        ).fetchall()
+
+    if not orphans:
+        print(f"  {G}✅ Нет постов pending без очереди — всё в порядке.{RESET}")
+        pause()
+        return
+
+    print(f"  {Y}Найдено постов без очереди: {len(orphans)}{RESET}")
+    print(f"  Режим очереди: {BOLD}{QUEUE_MODE}{RESET}\n")
+
+    # Предпросмотр
+    with get_db() as db:
+        for post in orphans:
+            if QUEUE_MODE == "distributed" and _QM:
+                rows = db.execute(
+                    """
+                    SELECT rv.TGID, COUNT(q.Post) AS cnt
+                    FROM reviewers rv
+                    LEFT JOIN queue q ON q.Reviewer = rv.TGID
+                    WHERE rv.Verified = 1
+                    GROUP BY rv.TGID ORDER BY cnt ASC
+                    """
+                ).fetchall()
+                import random
+                if rows:
+                    min_cnt = rows[0]["cnt"]
+                    candidates = [r["TGID"] for r in rows if r["cnt"] == min_cnt]
+                    reviewer = random.choice(candidates)
+                else:
+                    reviewer = None
+            else:
+                reviewer = None
+            label = reviewer or "общая очередь"
+            print(f"  #{post['ID']} {post['author']:<20} → {label}")
+
+    print()
+    if not confirm(f"Добавить {len(orphans)} постов в очередь?"):
+        return
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    added = 0
+
+    with get_db() as db:
+        for post in orphans:
+            if QUEUE_MODE == "distributed":
+                rows = db.execute(
+                    """
+                    SELECT rv.TGID, COUNT(q.Post) AS cnt
+                    FROM reviewers rv
+                    LEFT JOIN queue q ON q.Reviewer = rv.TGID
+                    WHERE rv.Verified = 1
+                    GROUP BY rv.TGID ORDER BY cnt ASC
+                    """
+                ).fetchall()
+                import random
+                if rows:
+                    min_cnt = rows[0]["cnt"]
+                    candidates = [r["TGID"] for r in rows if r["cnt"] == min_cnt]
+                    reviewer = random.choice(candidates)
+                else:
+                    reviewer = None
+            else:
+                reviewer = None
+
+            db.execute(
+                "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?, ?, ?)",
+                (post["ID"], reviewer, now),
+            )
+            db.commit()
+            added += 1
+
+    print(f"\n{G}  ✅ Добавлено в очередь: {added} постов.{RESET}")
+    pause()
+
+
 def manage_posts():
     actions = [
         view_all_posts, view_queue, find_post, find_post_by_author,
         release_stuck, reset_post, reject_post_cli, restore_post,
-        reassign_queue, clear_queue,
+        reassign_queue, clear_queue, fix_pending_queue,
     ]
     while True:
         choice = menu("📝 Управление постами", [
@@ -306,6 +398,7 @@ def manage_posts():
             "Восстановить отклонённый пост",
             "🔄 Переназначить очередь заново",
             "🗑  Очистить всю очередь",
+            "🔧 Восстановить pending без очереди",
         ])
         if choice == -1:
             return

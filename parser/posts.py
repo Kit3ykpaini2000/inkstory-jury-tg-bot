@@ -126,14 +126,32 @@ def _save_post(
 
 
 def _parse_page(url: str) -> dict | None:
-    """Загружает страницу и извлекает автора и текст. None при ошибке."""
+    """
+    Загружает страницу и извлекает автора и текст.
+
+    Возвращает:
+      dict   — успешно
+      None   — постоянная ошибка (404, нет автора) → ставить Parsed=1
+      raises — временная ошибка (таймаут, 5xx)    → НЕ ставить Parsed=1, попробуем позже
+    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
+    except (requests.Timeout, requests.ConnectionError) as e:
+        # Временная сетевая ошибка — пробрасываем наверх
+        raise
+
+    try:
         resp.raise_for_status()
-        resp.encoding = "utf-8"
-    except requests.RequestException as e:
-        log.error(f"[posts] Ошибка запроса {url}: {e}")
-        return None
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else 0
+        if status_code in (404, 410):
+            # Страница удалена — постоянная ошибка
+            log.warning(f"[posts] Страница недоступна ({status_code}): {url}")
+            return None
+        # 5xx, 429 и т.д. — временная ошибка
+        raise
+
+    resp.encoding = "utf-8"
 
     try:
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -197,10 +215,17 @@ def parse() -> dict[str, int]:
     for i, url in enumerate(links, 1):
         log.debug(f"[posts] [{i}/{len(links)}] {url}")
 
-        post = _parse_page(url)
+        try:
+            post = _parse_page(url)
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            # Временная ошибка — оставляем Parsed=0, попробуем при следующем запуске
+            log.warning(f"[posts] Временная ошибка, пропускаем: {url} — {e}")
+            time.sleep(PAGE_PAUSE_POSTS)
+            continue
 
         if not post:
-            # Не удалось спарсить — помечаем чтобы не зациклиться
+            # Постоянная ошибка (404, нет автора) — помечаем чтобы не трогать снова
+            log.warning(f"[posts] Постоянная ошибка, помечаем Parsed=1: {url}")
             parsed_urls.append(url)
             continue
 

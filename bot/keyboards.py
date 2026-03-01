@@ -51,11 +51,11 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 
 
 def queue_mode_keyboard(current_mode: str) -> InlineKeyboardMarkup:
-    open_mark        = "✅ " if current_mode == "open"        else ""
-    distributed_mark = "✅ " if current_mode == "distributed" else ""
+    m = {x: "✅ " if current_mode == x else "" for x in ("open", "distributed", "balanced")}
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{open_mark}🌐 Общая очередь",       callback_data="qmode_open")],
-        [InlineKeyboardButton(f"{distributed_mark}📊 По наименьшей", callback_data="qmode_distributed")],
+        [InlineKeyboardButton(f"{m['open']}🌐 Общая очередь",               callback_data="qmode_open")],
+        [InlineKeyboardButton(f"{m['distributed']}📊 По наименьшей очереди", callback_data="qmode_distributed")],
+        [InlineKeyboardButton(f"{m['balanced']}⚖️ По суммарной нагрузке",   callback_data="qmode_balanced")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")],
     ])
 

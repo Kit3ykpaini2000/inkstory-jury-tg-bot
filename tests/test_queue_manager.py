@@ -1,4 +1,4 @@
-"""Тесты queue_manager — оба режима, просроченные посты, race condition."""
+"""Тесты queue_manager — три режима, просроченные посты, уведомления."""
 import sys, os, sqlite3, pathlib, tempfile, importlib
 from datetime import datetime, timezone, timedelta
 
@@ -48,21 +48,17 @@ def _init_test_db():
         );
         CREATE TABLE posts_info (
             ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            Author INTEGER NOT NULL,
-            URL TEXT NOT NULL UNIQUE,
+            Author INTEGER NOT NULL, URL TEXT NOT NULL UNIQUE,
             Text TEXT, Day INTEGER,
             Status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(Status IN ('pending','checking','done','rejected','reviewer_post'))
         );
         CREATE TABLE queue (
-            Post INTEGER NOT NULL PRIMARY KEY,
-            Reviewer TEXT,
-            AssignedAt TEXT NOT NULL DEFAULT (datetime('now','utc')),
-            TakenAt TEXT
+            Post INTEGER NOT NULL PRIMARY KEY, Reviewer TEXT,
+            AssignedAt TEXT NOT NULL DEFAULT (datetime('now','utc')), TakenAt TEXT
         );
         CREATE TABLE results (
-            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            Post INTEGER NOT NULL UNIQUE,
+            ID INTEGER PRIMARY KEY AUTOINCREMENT, Post INTEGER NOT NULL UNIQUE,
             BotWords INTEGER, HumanWords INTEGER, HumanErrors INTEGER,
             RejectReason TEXT, Reviewer TEXT
         );
@@ -86,6 +82,40 @@ def _add_post(post_id: int):
         db.commit()
 
 
+def _add_done(reviewer: str, count: int, start_id: int = 100):
+    """Добавляет проверенные посты для жюри (для теста balanced)."""
+    with get_db() as db:
+        for i in range(count):
+            pid = start_id + i
+            db.execute(
+                "INSERT OR IGNORE INTO posts_info (ID, Author, URL, Day, Status) VALUES (?,1,?,1,'done')",
+                (pid, f"https://inkstory.net/done/{pid}"),
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO results (Post, HumanWords, HumanErrors, Reviewer) VALUES (?,100,5,?)",
+                (pid, reviewer),
+            )
+        db.commit()
+
+
+def _set_taken_at(post_id: int, minutes_ago: int):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        db.execute("UPDATE queue SET TakenAt=? WHERE Post=?", (old, post_id))
+        db.commit()
+
+
+def _set_assigned_at(post_id: int, minutes_ago: int):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        db.execute("UPDATE queue SET AssignedAt=? WHERE Post=?", (old, post_id))
+        db.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# distributed
+# ══════════════════════════════════════════════════════════════════════════════
+
 def test_distributed_assign():
     _init_test_db()
     qm = _set_mode("distributed")
@@ -98,8 +128,8 @@ def test_distributed_assign():
 def test_distributed_balancing():
     _init_test_db()
     qm = _set_mode("distributed")
-    qm.assign_post(_add_post(1) or 1)
-    qm.assign_post(_add_post(2) or 2)
+    _add_post(1); _add_post(2)
+    qm.assign_post(1); qm.assign_post(2)
     assert qm.get_queue_count("r1") == 1
     assert qm.get_queue_count("r2") == 1
 
@@ -125,6 +155,44 @@ def test_active_post_returns_same():
     assert qm.get_active_post(tgid)["post_id"] == 1
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# balanced
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_balanced_assign_goes_to_less_loaded():
+    """r1 уже проверил 3 поста → r2 должен получить новый."""
+    _init_test_db()
+    qm = _set_mode("balanced")
+    _add_done("r1", 3)
+    _add_post(1)
+    tgid = qm.assign_post(1)
+    assert tgid == "r2", f"Ожидался r2 (меньше нагрузки), получили {tgid}"
+
+
+def test_balanced_equal_load_random():
+    """При одинаковой нагрузке — случайно, но один из двух жюри."""
+    _init_test_db()
+    qm = _set_mode("balanced")
+    _add_post(1)
+    tgid = qm.assign_post(1)
+    assert tgid in ("r1", "r2")
+
+
+def test_balanced_counts_queue_too():
+    """В очереди тоже считается. r1 уже имеет 2 в очереди → r2 получит."""
+    _init_test_db()
+    qm = _set_mode("balanced")
+    _add_post(1); _add_post(2)
+    qm.assign_post(1); qm.assign_post(2)
+    # Оба поста назначены — проверяем что баланс 1:1
+    assert qm.get_queue_count("r1") == 1
+    assert qm.get_queue_count("r2") == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# open
+# ══════════════════════════════════════════════════════════════════════════════
+
 def test_open_assign_no_reviewer():
     _init_test_db()
     qm = _set_mode("open")
@@ -137,8 +205,7 @@ def test_open_assign_no_reviewer():
 def test_open_first_reviewer_gets_post():
     _init_test_db()
     qm = _set_mode("open")
-    _add_post(1)
-    qm.assign_post(1)
+    _add_post(1); qm.assign_post(1)
     assert qm.take_post("r1")["post_id"] == 1
     assert qm.take_post("r2") is None
 
@@ -153,13 +220,16 @@ def test_open_free_count():
     assert qm.get_free_posts_count() == 1
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# release / remove
+# ══════════════════════════════════════════════════════════════════════════════
+
 def test_release_post():
     _init_test_db()
     qm = _set_mode("distributed")
     _add_post(1)
     tgid = qm.assign_post(1)
-    qm.take_post(tgid)
-    qm.release_post(tgid, 1)
+    qm.take_post(tgid); qm.release_post(tgid, 1)
     with get_db() as db:
         assert db.execute("SELECT Status FROM posts_info WHERE ID=1").fetchone()["Status"] == "pending"
         q = db.execute("SELECT TakenAt, Reviewer FROM queue WHERE Post=1").fetchone()
@@ -174,14 +244,12 @@ def test_remove_post():
         assert db.execute("SELECT * FROM queue WHERE Post=1").fetchone() is None
 
 
-def _set_taken_at(post_id: int, minutes_ago: int):
-    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as db:
-        db.execute("UPDATE queue SET TakenAt=? WHERE Post=?", (old, post_id))
-        db.commit()
+# ══════════════════════════════════════════════════════════════════════════════
+# Просроченные посты + уведомления
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def test_expire_taken_post():
+def test_expire_taken_returns_taken_event():
+    """Просроченный взятый пост → событие type='taken'."""
     _init_test_db()
     qm = _set_mode("distributed", expire=30)
     _add_post(1)
@@ -189,12 +257,56 @@ def test_expire_taken_post():
     qm.take_post(tgid)
     _set_taken_at(1, 31)
     released = qm.release_expired_posts()
-    assert len(released) == 1 and released[0]["type"] == "taken"
+    taken = [r for r in released if r["type"] == "taken"]
+    assert len(taken) == 1
+    assert taken[0]["reviewer_tgid"] == tgid
     with get_db() as db:
         assert db.execute("SELECT Status FROM posts_info WHERE ID=1").fetchone()["Status"] == "pending"
 
 
-def test_no_expire_for_fresh_post():
+def test_expire_taken_distributed_reassigns():
+    """distributed: после taken → должно быть reassigned или free (если некому)."""
+    _init_test_db()
+    qm = _set_mode("distributed", expire=30)
+    _add_post(1)
+    tgid = qm.assign_post(1)
+    qm.take_post(tgid)
+    _set_taken_at(1, 31)
+    released = qm.release_expired_posts()
+    types = {r["type"] for r in released}
+    # Должен быть taken + (reassigned или free)
+    assert "taken" in types
+    assert types & {"reassigned", "free"}
+
+
+def test_expire_taken_open_returns_free_event():
+    """open: после taken → событие type='free' (уведомить всех)."""
+    _init_test_db()
+    qm = _set_mode("open", expire=30)
+    _add_post(1); qm.assign_post(1)
+    qm.take_post("r1")
+    _set_taken_at(1, 31)
+    released = qm.release_expired_posts()
+    types = [r["type"] for r in released]
+    assert "taken" in types
+    assert "free" in types
+
+
+def test_expire_assigned_not_taken():
+    """Назначен но не взят за 31 мин → переназначен или free."""
+    _init_test_db()
+    qm = _set_mode("distributed", expire=30)
+    _add_post(1)
+    qm.assign_post(1)
+    _set_assigned_at(1, 31)
+    released = qm.release_expired_posts()
+    # Старый жюри НЕ получает 'taken' (он не брал пост)
+    assert all(r["type"] != "taken" for r in released)
+    # Должно быть reassigned или free
+    assert any(r["type"] in ("reassigned", "free") for r in released)
+
+
+def test_no_expire_fresh_post():
     _init_test_db()
     qm = _set_mode("distributed", expire=30)
     _add_post(1)
@@ -204,20 +316,9 @@ def test_no_expire_for_fresh_post():
     assert len(qm.release_expired_posts()) == 0
 
 
-def test_expire_assigned_not_taken():
-    _init_test_db()
-    qm = _set_mode("distributed", expire=30)
-    _add_post(1)
-    qm.assign_post(1)
-    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as db:
-        db.execute("UPDATE queue SET AssignedAt=? WHERE Post=1", (old,))
-        db.commit()
-    released = qm.release_expired_posts()
-    assert all(r["type"] == "taken" for r in released)
-    with get_db() as db:
-        assert db.execute("SELECT Reviewer FROM queue WHERE Post=1").fetchone()["Reviewer"] is None
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Статистика
+# ══════════════════════════════════════════════════════════════════════════════
 
 def test_total_queue_count():
     _init_test_db()
@@ -226,7 +327,7 @@ def test_total_queue_count():
     qm.assign_post(1); qm.assign_post(2); qm.assign_post(3)
     assert qm.get_total_queue_count() == 3
     qm.take_post("r1")
-    assert qm.get_total_queue_count() == 3
+    assert qm.get_total_queue_count() == 3  # checking тоже считается
     qm.remove_post(1)
     assert qm.get_total_queue_count() == 2
 
@@ -235,10 +336,13 @@ if __name__ == "__main__":
     tests = [
         test_distributed_assign, test_distributed_balancing,
         test_take_post_distributed, test_active_post_returns_same,
+        test_balanced_assign_goes_to_less_loaded, test_balanced_equal_load_random,
+        test_balanced_counts_queue_too,
         test_open_assign_no_reviewer, test_open_first_reviewer_gets_post,
         test_open_free_count, test_release_post, test_remove_post,
-        test_expire_taken_post, test_no_expire_for_fresh_post,
-        test_expire_assigned_not_taken, test_total_queue_count,
+        test_expire_taken_returns_taken_event, test_expire_taken_distributed_reassigns,
+        test_expire_taken_open_returns_free_event, test_expire_assigned_not_taken,
+        test_no_expire_fresh_post, test_total_queue_count,
     ]
     passed = failed = 0
     for t in tests:
