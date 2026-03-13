@@ -1,7 +1,10 @@
 """
-cli.py — консольное управление БД inkstory
+cli.py — консольное управление inkstory-bot
 
 Запуск: python cli.py
+
+Включает: статистику, управление жюри/постами/днями/ссылками,
+          просмотр логов, инициализацию БД, экспорт результатов.
 """
 
 import os
@@ -316,29 +319,41 @@ def fix_pending_queue():
     print(f"  Режим очереди: {BOLD}{QUEUE_MODE}{RESET}\n")
 
     # Предпросмотр
-    with get_db() as db:
-        for post in orphans:
-            if QUEUE_MODE == "distributed" and _QM:
+    for post in orphans:
+        if QUEUE_MODE == "balanced" and _QM:
+            with get_db() as db:
                 rows = db.execute(
                     """
-                    SELECT rv.TGID, COUNT(q.Post) AS cnt
+                    SELECT
+                        rv.TGID,
+                        COUNT(DISTINCT q.Post) AS in_queue,
+                        COUNT(DISTINCT CASE WHEN r.HumanWords IS NOT NULL THEN r.Post END) AS checked,
+                        COUNT(DISTINCT CASE WHEN p2.Status = 'rejected' AND r2.Reviewer = rv.TGID
+                                            THEN r2.Post END) AS rejected
                     FROM reviewers rv
-                    LEFT JOIN queue q ON q.Reviewer = rv.TGID
+                    LEFT JOIN queue   q  ON q.Reviewer  = rv.TGID
+                    LEFT JOIN results r  ON r.Reviewer  = rv.TGID
+                    LEFT JOIN results r2 ON r2.Reviewer = rv.TGID
+                    LEFT JOIN posts_info p2 ON p2.ID = r2.Post
                     WHERE rv.Verified = 1
-                    GROUP BY rv.TGID ORDER BY cnt ASC
+                    GROUP BY rv.TGID
+                    ORDER BY (in_queue + checked + rejected) ASC
                     """
                 ).fetchall()
-                import random
-                if rows:
-                    min_cnt = rows[0]["cnt"]
-                    candidates = [r["TGID"] for r in rows if r["cnt"] == min_cnt]
-                    reviewer = random.choice(candidates)
-                else:
-                    reviewer = None
+            import random
+            if rows:
+                min_total = rows[0]["in_queue"] + rows[0]["checked"] + rows[0]["rejected"]
+                candidates = [
+                    r["TGID"] for r in rows
+                    if r["in_queue"] + r["checked"] + r["rejected"] == min_total
+                ]
+                reviewer = random.choice(candidates)
             else:
                 reviewer = None
-            label = reviewer or "общая очередь"
-            print(f"  #{post['ID']} {post['author']:<20} → {label}")
+        else:
+            reviewer = None
+        label = reviewer or "общая очередь"
+        print(f"  #{post['ID']} {post['author']:<20} → {label}")
 
     print()
     if not confirm(f"Добавить {len(orphans)} постов в очередь?"):
@@ -349,31 +364,15 @@ def fix_pending_queue():
 
     with get_db() as db:
         for post in orphans:
-            if QUEUE_MODE == "distributed":
-                rows = db.execute(
-                    """
-                    SELECT rv.TGID, COUNT(q.Post) AS cnt
-                    FROM reviewers rv
-                    LEFT JOIN queue q ON q.Reviewer = rv.TGID
-                    WHERE rv.Verified = 1
-                    GROUP BY rv.TGID ORDER BY cnt ASC
-                    """
-                ).fetchall()
-                import random
-                if rows:
-                    min_cnt = rows[0]["cnt"]
-                    candidates = [r["TGID"] for r in rows if r["cnt"] == min_cnt]
-                    reviewer = random.choice(candidates)
-                else:
-                    reviewer = None
+            if _QM:
+                from parser.queue_manager import assign_post
+                assign_post(post["ID"])
             else:
-                reviewer = None
-
-            db.execute(
-                "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?, ?, ?)",
-                (post["ID"], reviewer, now),
-            )
-            db.commit()
+                db.execute(
+                    "INSERT OR IGNORE INTO queue (Post, Reviewer, AssignedAt) VALUES (?, NULL, ?)",
+                    (post["ID"], now),
+                )
+                db.commit()
             added += 1
 
     print(f"\n{G}  ✅ Добавлено в очередь: {added} постов.{RESET}")
@@ -851,11 +850,8 @@ def list_days():
 
 def create_day():
     header("➕ Создать новый день")
-    try:
-        from pytz import timezone as _tz
-        today = datetime.now(_tz("Europe/Moscow")).strftime("%d.%m.%Y")
-    except ImportError:
-        today = datetime.now().strftime("%d.%m.%Y")
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
     label = input(f"  Название/дата [{today}]: {W}").strip(); print(RESET, end="")
     if not label:
         label = today
@@ -1173,13 +1169,388 @@ def full_reset():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ИНИЦИАЛИЗАЦИЯ БД
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCHEMA = """
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS reviewers (
+    TGID     TEXT    PRIMARY KEY,
+    URL      TEXT    NOT NULL UNIQUE,
+    Name     TEXT    NOT NULL,
+    IsAdmin  INTEGER NOT NULL DEFAULT 0,
+    Verified INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS authors (
+    ID   INTEGER PRIMARY KEY AUTOINCREMENT,
+    Name TEXT    NOT NULL,
+    URL  TEXT    NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS days (
+    Day  INTEGER PRIMARY KEY AUTOINCREMENT,
+    Data TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS links (
+    URL    TEXT    PRIMARY KEY,
+    Parsed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS blacklist (
+    URL TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS posts_info (
+    ID     INTEGER PRIMARY KEY AUTOINCREMENT,
+    Author INTEGER NOT NULL REFERENCES authors(ID),
+    URL    TEXT    NOT NULL UNIQUE,
+    Text   TEXT,
+    Day    INTEGER REFERENCES days(Day),
+    Status TEXT    NOT NULL DEFAULT 'pending'
+        CHECK(Status IN ('pending','checking','done','rejected','reviewer_post'))
+);
+
+CREATE TABLE IF NOT EXISTS queue (
+    Post       INTEGER NOT NULL PRIMARY KEY REFERENCES posts_info(ID),
+    Reviewer   TEXT    REFERENCES reviewers(TGID),
+    AssignedAt TEXT    NOT NULL DEFAULT (datetime('now','utc')),
+    TakenAt    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS results (
+    ID            INTEGER PRIMARY KEY AUTOINCREMENT,
+    Post          INTEGER NOT NULL UNIQUE REFERENCES posts_info(ID),
+    BotWords      INTEGER,
+    HumanWords    INTEGER,
+    HumanErrors   INTEGER,
+    ErrorsPer1000 REAL GENERATED ALWAYS AS (
+        ROUND(HumanErrors * 1000.0 / NULLIF(HumanWords, 0), 2)
+    ) STORED,
+    RejectReason  TEXT,
+    Reviewer      TEXT REFERENCES reviewers(TGID)
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_parsed       ON links(Parsed);
+CREATE INDEX IF NOT EXISTS idx_posts_status       ON posts_info(Status);
+CREATE INDEX IF NOT EXISTS idx_queue_reviewer     ON queue(Reviewer);
+CREATE INDEX IF NOT EXISTS idx_queue_assignedat   ON queue(AssignedAt);
+CREATE INDEX IF NOT EXISTS idx_queue_takenat      ON queue(TakenAt);
+CREATE INDEX IF NOT EXISTS idx_results_reviewer   ON results(Reviewer);
+"""
+
+DB_PATH = ROOT / "data" / "main.db"
+
+
+def init_db():
+    header("🗄  Инициализация базы данных")
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not DB_PATH.exists()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+    status = f"{G}создана{RESET}" if is_new else f"{Y}уже существует, проверена{RESET}"
+    print(f"  ✅ База данных {status}: {DB_PATH}\n")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    print(f"  {'Таблица':<22} {'Записей':>8}")
+    hr()
+    for t in tables:
+        count = conn.execute(f"SELECT COUNT(*) FROM {t['name']}").fetchone()[0]
+        print(f"  {t['name']:<22} {count:>8}")
+    conn.close()
+    pause()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ЭКСПОРТ РЕЗУЛЬТАТОВ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def export_results():
+    header("📊 Экспорт результатов в Excel")
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    except ImportError:
+        print(f"  {R}❌ Не установлен openpyxl. Выполни: pip install openpyxl{RESET}")
+        pause()
+        return
+
+    # ── Стили ─────────────────────────────────────────────────────────────────
+    CLR_HEADER    = "2C3E50"
+    CLR_SUBHEADER = "5D6D7E"
+    CLR_ACCENT    = "3498DB"
+    CLR_EVEN      = "EBF5FB"
+    CLR_WHITE     = "FFFFFF"
+    CLR_LIGHT     = "FFFFFF"
+    CLR_DARK      = "1A1A1A"
+
+    def _font(size=10, bold=False, color=CLR_DARK):
+        return Font(name="Arial", size=size, bold=bold, color=color)
+
+    def _fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def _border():
+        s = Side(style="thin", color="BDC3C7")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def _align(h="center"):
+        return Alignment(horizontal=h, vertical="center", wrap_text=True)
+
+    def _header_row(ws, row, cols, bg=CLR_HEADER):
+        for c in range(1, cols + 1):
+            cell = ws.cell(row=row, column=c)
+            cell.font      = _font(10, bold=True, color=CLR_LIGHT)
+            cell.fill      = _fill(bg)
+            cell.alignment = _align("center")
+            cell.border    = _border()
+        ws.row_dimensions[row].height = 22
+
+    def _data_row(ws, row, cols, even=False):
+        for c in range(1, cols + 1):
+            cell = ws.cell(row=row, column=c)
+            cell.font      = _font(10)
+            cell.fill      = _fill(CLR_EVEN if even else CLR_WHITE)
+            cell.alignment = _align("left" if c == 1 else "center")
+            cell.border    = _border()
+        ws.row_dimensions[row].height = 20
+
+    def _totals_row(ws, row, cols):
+        for c in range(1, cols + 1):
+            cell = ws.cell(row=row, column=c)
+            cell.font      = _font(10, bold=True, color=CLR_LIGHT)
+            cell.fill      = _fill(CLR_HEADER)
+            cell.alignment = _align("center")
+            cell.border    = _border()
+        ws.row_dimensions[row].height = 22
+
+    # ── Запросы ────────────────────────────────────────────────────────────────
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    days = conn.execute("SELECT Day, Data FROM days ORDER BY Day").fetchall()
+
+    def get_posts_by_day(day_id):
+        return conn.execute(
+            """
+            SELECT a.Name AS author, COUNT(p.ID) AS post_count,
+                   COALESCE(SUM(r.HumanWords), 0) AS words,
+                   COALESCE(SUM(r.HumanErrors), 0) AS errors
+            FROM posts_info p
+            JOIN authors a ON p.Author = a.ID
+            JOIN results r ON r.Post = p.ID
+            WHERE p.Day = ? AND p.Status = 'done' AND r.HumanWords IS NOT NULL
+            GROUP BY a.ID
+            ORDER BY errors * 1.0 / NULLIF(words, 0) ASC
+            """, (day_id,)
+        ).fetchall()
+
+    def get_summary_by_day():
+        return conn.execute(
+            """
+            SELECT d.Data AS date, COUNT(p.ID) AS posts,
+                   COALESCE(SUM(r.HumanWords), 0) AS words,
+                   COALESCE(SUM(r.HumanErrors), 0) AS errors
+            FROM days d
+            LEFT JOIN posts_info p ON p.Day = d.Day AND p.Status = 'done'
+            LEFT JOIN results r ON r.Post = p.ID AND r.HumanWords IS NOT NULL
+            GROUP BY d.Day ORDER BY d.Day
+            """
+        ).fetchall()
+
+    def get_top_authors():
+        return conn.execute(
+            """
+            SELECT a.Name AS author, COUNT(p.ID) AS post_count,
+                   COALESCE(SUM(r.HumanWords), 0) AS words,
+                   COALESCE(SUM(r.HumanErrors), 0) AS errors
+            FROM posts_info p
+            JOIN authors a ON p.Author = a.ID
+            JOIN results r ON r.Post = p.ID
+            WHERE p.Status = 'done' AND r.HumanWords IS NOT NULL
+            GROUP BY a.ID HAVING words > 0
+            ORDER BY errors * 1.0 / words ASC
+            """
+        ).fetchall()
+
+    def get_reviewer_stats():
+        return conn.execute(
+            """
+            SELECT rv.Name, COUNT(r.ID) AS checked,
+                   COALESCE(SUM(r.HumanWords), 0) AS words,
+                   COALESCE(SUM(r.HumanErrors), 0) AS errors
+            FROM reviewers rv
+            LEFT JOIN results r ON r.Reviewer = rv.TGID AND r.HumanWords IS NOT NULL
+            WHERE rv.Verified = 1
+            GROUP BY rv.TGID ORDER BY checked DESC
+            """
+        ).fetchall()
+
+    # ── Сборка Excel ──────────────────────────────────────────────────────────
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Лист: Общий отчёт
+    ws = wb.create_sheet("Общий отчёт")
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells("A1:F1")
+    ws["A1"].value     = "ИТОГИ КОНКУРСА inkstory.net"
+    ws["A1"].font      = _font(16, bold=True, color=CLR_LIGHT)
+    ws["A1"].fill      = _fill(CLR_HEADER)
+    ws["A1"].alignment = _align("center")
+    ws.row_dimensions[1].height = 36
+
+    ws.merge_cells("A2:F2")
+    ws["A2"].value     = f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    ws["A2"].font      = _font(10, color=CLR_LIGHT)
+    ws["A2"].fill      = _fill(CLR_SUBHEADER)
+    ws["A2"].alignment = _align("center")
+    ws.row_dimensions[2].height = 18
+
+    ws.row_dimensions[3].height = 10
+
+    ws.merge_cells("A4:F4")
+    ws["A4"].value     = "ПО ДНЯМ КОНКУРСА"
+    ws["A4"].font      = _font(11, bold=True, color=CLR_LIGHT)
+    ws["A4"].fill      = _fill(CLR_ACCENT)
+    ws["A4"].alignment = _align("center")
+    ws.row_dimensions[4].height = 24
+
+    for c, h in enumerate(["Дата", "Принято постов", "Слов (жюри)", "Ошибок", "Ошибок / 1000 слов", ""], 1):
+        ws.cell(row=5, column=c).value = h
+    _header_row(ws, 5, 5)
+
+    day_summary = get_summary_by_day()
+    for i, d in enumerate(day_summary, 1):
+        r = 5 + i
+        for c, v in enumerate([d["date"], d["posts"], d["words"], d["errors"], f"=IFERROR(ROUND(D{r}/C{r}*1000,1),0)"], 1):
+            ws.cell(row=r, column=c).value = v
+        _data_row(ws, r, 5, even=(i % 2 == 0))
+
+    first, last = 6, 5 + len(day_summary)
+    tr = last + 1
+    _totals_row(ws, tr, 5)
+    ws.cell(row=tr, column=1).value = "ИТОГО"
+    for c, v in enumerate([f"=SUM(B{first}:B{last})", f"=SUM(C{first}:C{last})", f"=SUM(D{first}:D{last})", f"=IFERROR(ROUND(D{tr}/C{tr}*1000,1),0)"], 2):
+        ws.cell(row=tr, column=c).value = v
+
+    r2 = tr + 2
+    ws.merge_cells(f"A{r2}:F{r2}")
+    ws[f"A{r2}"].value = "СТАТИСТИКА ЖЮРИ"
+    ws[f"A{r2}"].font = _font(11, bold=True, color=CLR_LIGHT)
+    ws[f"A{r2}"].fill = _fill(CLR_ACCENT)
+    ws[f"A{r2}"].alignment = _align("center")
+    ws.row_dimensions[r2].height = 24
+
+    r2 += 1
+    for c, h in enumerate(["Жюри", "Проверено постов", "Слов проверено", "Ошибок найдено", "Ошибок / 1000 слов", ""], 1):
+        ws.cell(row=r2, column=c).value = h
+    _header_row(ws, r2, 5)
+
+    for i, rv in enumerate(get_reviewer_stats(), 1):
+        r2 += 1
+        for c, v in enumerate([rv["Name"], rv["checked"], rv["words"], rv["errors"], f"=IFERROR(ROUND(D{r2}/C{r2}*1000,1),0)"], 1):
+            ws.cell(row=r2, column=c).value = v
+        _data_row(ws, r2, 5, even=(i % 2 == 0))
+
+    r3 = r2 + 2
+    ws.merge_cells(f"A{r3}:F{r3}")
+    ws[f"A{r3}"].value = "ТОП УЧАСТНИКОВ — меньше всего ошибок на 1000 слов"
+    ws[f"A{r3}"].font = _font(11, bold=True, color=CLR_LIGHT)
+    ws[f"A{r3}"].fill = _fill(CLR_ACCENT)
+    ws[f"A{r3}"].alignment = _align("center")
+    ws.row_dimensions[r3].height = 24
+
+    r3 += 1
+    for c, h in enumerate(["#", "Участник", "Постов", "Слов", "Ошибок", "Ошибок / 1000 слов"], 1):
+        ws.cell(row=r3, column=c).value = h
+    _header_row(ws, r3, 6)
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, a in enumerate(get_top_authors(), 1):
+        r3 += 1
+        for c, v in enumerate([medals.get(i, i), a["author"], a["post_count"], a["words"], a["errors"], f"=IFERROR(ROUND(E{r3}/D{r3}*1000,1),0)"], 1):
+            ws.cell(row=r3, column=c).value = v
+        _data_row(ws, r3, 6, even=(i % 2 == 0))
+
+    for col, w in zip("ABCDEF", [6, 24, 10, 12, 12, 22]):
+        ws.column_dimensions[col].width = w
+
+    # Листы по дням
+    for day in days:
+        ws_day = wb.create_sheet(day["Data"])
+        ws_day.sheet_view.showGridLines = False
+
+        ws_day.merge_cells("A1:F1")
+        ws_day["A1"].value     = day["Data"]
+        ws_day["A1"].font      = _font(14, bold=True, color=CLR_LIGHT)
+        ws_day["A1"].fill      = _fill(CLR_HEADER)
+        ws_day["A1"].alignment = _align("center")
+        ws_day.row_dimensions[1].height = 30
+        ws_day.row_dimensions[2].height = 8
+
+        for c, h in enumerate(["Юзер", "Постов", "Слов", "Ошибок", "Ошибок / 1000 слов", ""], 1):
+            ws_day.cell(row=3, column=c).value = h
+        _header_row(ws_day, 3, 5)
+
+        posts = get_posts_by_day(day["Day"])
+        if not posts:
+            ws_day.merge_cells("A4:F4")
+            ws_day["A4"].value     = "Нет данных за этот день"
+            ws_day["A4"].font      = _font(color="888888")
+            ws_day["A4"].alignment = _align("center")
+        else:
+            for i, p in enumerate(posts, 1):
+                r = 3 + i
+                for c, v in enumerate([p["author"], p["post_count"], p["words"], p["errors"], f"=IFERROR(ROUND(D{r}/C{r}*1000,1),0)"], 1):
+                    ws_day.cell(row=r, column=c).value = v
+                _data_row(ws_day, r, 5, even=(i % 2 == 0))
+
+            first, last = 4, 3 + len(posts)
+            tr = last + 1
+            _totals_row(ws_day, tr, 5)
+            ws_day.cell(row=tr, column=1).value = "ИТОГО"
+            for c, v in enumerate([f"=SUM(B{first}:B{last})", f"=SUM(C{first}:C{last})", f"=SUM(D{first}:D{last})", f"=IFERROR(ROUND(D{tr}/C{tr}*1000,1),0)"], 2):
+                ws_day.cell(row=tr, column=c).value = v
+
+        for col, w in zip("ABCDEF", [22, 10, 12, 12, 22, 4]):
+            ws_day.column_dimensions[col].width = w
+
+    conn.close()
+
+    results_dir = ROOT / "results"
+    results_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    out_path  = results_dir / f"results_{timestamp}.xlsx"
+    wb.save(out_path)
+
+    print(f"  {G}✅ Экспорт завершён:{RESET} {out_path}")
+    pause()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ГЛАВНОЕ МЕНЮ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     actions = [
         show_stats, manage_reviewers, manage_posts,
-        manage_days, manage_links, view_logs, full_reset,
+        manage_days, manage_links, view_logs,
+        init_db, export_results, full_reset,
     ]
     try:
         while True:
@@ -1190,6 +1561,8 @@ def main():
                 "📅 Управление днями",
                 "🔗 Управление ссылками",
                 "📄 Просмотр логов",
+                "🗄  Инициализация БД",
+                "📤 Экспорт результатов",
                 "🗑  Полная очистка данных",
             ], show_stats=True)
             if choice == -1:

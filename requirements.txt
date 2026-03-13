@@ -1,7 +1,7 @@
-python-telegram-bot[job-queue]
-requests
-beautifulsoup4
-python-dotenv
-pytz
-groq
-openpyxl
+python-telegram-bot[job-queue]>=21.0,<22.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0
+pytz>=2024.1
+groq>=0.9.0
+openpyxl>=3.1.0

@@ -12,6 +12,8 @@ from utils.database import get_db
 from utils.config import MAX_WORDS, MAX_ERRORS
 from utils.ai_utils import check_post
 from utils.logger import setup_logger
+from utils.constants import PostStatus
+from utils.db_helpers import is_registered, is_verified, is_admin
 from parser.queue_manager import (
     take_post, get_active_post, release_post, remove_post,
     get_total_queue_count,
@@ -35,29 +37,6 @@ log = setup_logger()
 
 # ── Хелперы БД ────────────────────────────────────────────────────────────────
 
-def _is_registered(tg_id: str) -> bool:
-    with get_db() as db:
-        return db.execute(
-            "SELECT 1 FROM reviewers WHERE TGID=?", (tg_id,)
-        ).fetchone() is not None
-
-
-def _is_verified(tg_id: str) -> bool:
-    with get_db() as db:
-        row = db.execute(
-            "SELECT Verified FROM reviewers WHERE TGID=?", (tg_id,)
-        ).fetchone()
-        return row is not None and row["Verified"] == 1
-
-
-def _is_admin(tg_id: str) -> bool:
-    with get_db() as db:
-        row = db.execute(
-            "SELECT IsAdmin FROM reviewers WHERE TGID=?", (tg_id,)
-        ).fetchone()
-        return row is not None and row["IsAdmin"] == 1
-
-
 def _register(tg_id: str, name: str, url: str) -> None:
     with get_db() as db:
         db.execute(
@@ -68,7 +47,7 @@ def _register(tg_id: str, name: str, url: str) -> None:
 
 
 def _skip_post(post_id: int, tgid: str, reason: str) -> None:
-    """Освобождает пост с причиной пропуска (пишем в лог, пост возвращается в очередь)."""
+    """Освобождает пост с причиной пропуска."""
     release_post(tgid, post_id)
     log.info(f"[skip] {tgid} → #{post_id}: {reason}")
 
@@ -78,7 +57,6 @@ def _reject_post(post_id: int, tgid: str, reason: str) -> bool:
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
 
-        # Проверяем что пост действительно у этого жюри
         row = db.execute(
             "SELECT Post FROM queue WHERE Post=? AND Reviewer=? AND TakenAt IS NOT NULL",
             (post_id, tgid),
@@ -89,8 +67,8 @@ def _reject_post(post_id: int, tgid: str, reason: str) -> bool:
             return False
 
         db.execute(
-            "UPDATE posts_info SET Status='rejected' WHERE ID=?",
-            (post_id,),
+            "UPDATE posts_info SET Status=? WHERE ID=?",
+            (PostStatus.REJECTED, post_id),
         )
         db.execute(
             "UPDATE results SET RejectReason=?, Reviewer=? WHERE Post=?",
@@ -122,8 +100,8 @@ def _save_result(post_id: int, tgid: str, words: int, errors: int) -> bool:
             (words, errors, tgid, post_id),
         )
         db.execute(
-            "UPDATE posts_info SET Status='done' WHERE ID=?",
-            (post_id,),
+            "UPDATE posts_info SET Status=? WHERE ID=?",
+            (PostStatus.DONE, post_id),
         )
         db.execute("COMMIT")
 
@@ -139,7 +117,7 @@ def _get_my_stats(tg_id: str) -> dict | None:
             SELECT
                 rv.Name,
                 COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked,
-                COUNT(CASE WHEN p.Status='rejected' AND r.Reviewer=rv.TGID THEN 1 END) AS rejected,
+                COUNT(CASE WHEN p.Status=? AND r.Reviewer=rv.TGID THEN 1 END) AS rejected,
                 COALESCE(SUM(r.HumanWords),  0) AS total_words,
                 COALESCE(SUM(r.HumanErrors), 0) AS total_errors
             FROM reviewers rv
@@ -148,7 +126,7 @@ def _get_my_stats(tg_id: str) -> dict | None:
             WHERE rv.TGID = ?
             GROUP BY rv.TGID
             """,
-            (tg_id,),
+            (PostStatus.REJECTED, tg_id),
         ).fetchone()
     if not row:
         return None
@@ -167,11 +145,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     await update.message.reply_text("👋 Привет!", reply_markup=ReplyKeyboardRemove())
 
-    if not _is_registered(tg_id):
+    if not is_registered(tg_id):
         await update.message.reply_text("Для регистрации используй /register")
         return
 
-    if not _is_verified(tg_id):
+    if not is_verified(tg_id):
         await update.message.reply_text(
             "Ты зарегистрирован ✅\n"
             "⏳ Ожидаешь верификации от администратора.\n\n"
@@ -185,14 +163,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats — моя статистика\n"
         "/fullstats — общая статистика"
     )
-    if _is_admin(tg_id):
+    if is_admin(tg_id):
         commands += "\n/admin — панель администратора"
     await update.message.reply_text(commands)
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    if _is_registered(tg_id):
+    if is_registered(tg_id):
         await update.message.reply_text("Ты уже зарегистрирован ✅")
         return ConversationHandler.END
 
@@ -226,7 +204,7 @@ async def got_reg_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    if not _is_registered(tg_id):
+    if not is_registered(tg_id):
         await update.message.reply_text("Сначала зарегистрируйся через /register")
         return
 
@@ -250,16 +228,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_fullstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    if not _is_registered(tg_id):
+    if not is_registered(tg_id):
         await update.message.reply_text("Сначала зарегистрируйся через /register")
         return
 
     with get_db() as db:
         checked  = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status='done'"
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.DONE,)
         ).fetchone()[0]
         rejected = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status='rejected'"
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.REJECTED,)
         ).fetchone()[0]
 
     await update.message.reply_text(
@@ -274,18 +252,17 @@ async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     name  = update.effective_user.username or update.effective_user.first_name
 
-    if not _is_registered(tg_id):
+    if not is_registered(tg_id):
         await update.message.reply_text("Сначала зарегистрируйся через /register")
         return ConversationHandler.END
 
-    if not _is_verified(tg_id):
+    if not is_verified(tg_id):
         await update.message.reply_text(
             "⏳ Твоя учётная запись ещё не верифицирована.\n"
             "Дождись подтверждения от администратора."
         )
         return ConversationHandler.END
 
-    # Сначала смотрим есть ли уже активный пост
     post = get_active_post(tg_id)
     if post:
         log.info(f"[next] {name} уже имеет активный пост #{post['post_id']}")

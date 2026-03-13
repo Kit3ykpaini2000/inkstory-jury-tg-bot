@@ -4,9 +4,12 @@ parser/posts.py — парсинг постов через requests + BeautifulS
 Логика:
 1. Берём ссылки с Parsed=0 из таблицы links
 2. Загружаем страницу, извлекаем автора и текст
-3. Если автор — верифицированный жюри → Status='reviewer_post', в очередь не идёт
-4. Иначе → Status='pending', добавляем в queue через assign_post()
+3. Если автор — верифицированный жюри → Status=reviewer_post, в очередь не идёт
+4. Иначе → Status=pending, сохраняем в БД
 5. Помечаем ссылку Parsed=1 только после успешного сохранения
+
+Назначение постов в очередь (assign_post) выполняется в scheduler.py,
+не здесь — parse() возвращает список новых post_id.
 """
 
 import time
@@ -14,10 +17,10 @@ import requests
 from bs4 import BeautifulSoup
 
 from utils.database import get_db
-from utils.config import PAGE_PAUSE_POSTS, QUEUE_MODE
+from utils.config import PAGE_PAUSE_POSTS
 from utils.logger import setup_logger
 from utils.word_counter import count_words
-from parser.queue_manager import assign_post
+from utils.constants import PostStatus
 
 log = setup_logger()
 
@@ -75,12 +78,11 @@ def _save_post(
     Сохраняет пост атомарно.
     Возвращает post_id для постов участников или None для постов жюри/ошибки.
     """
-    status = "reviewer_post" if is_reviewer else "pending"
+    status = PostStatus.REVIEWER_POST if is_reviewer else PostStatus.PENDING
 
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
         try:
-            # Автор
             row = db.execute(
                 "SELECT ID FROM authors WHERE URL=?", (author_url,)
             ).fetchone()
@@ -93,7 +95,6 @@ def _save_post(
                 )
                 author_id = cur.lastrowid
 
-            # Пост
             cur = db.execute(
                 """
                 INSERT OR IGNORE INTO posts_info (Author, URL, Text, Day, Status)
@@ -109,7 +110,6 @@ def _save_post(
                 ).fetchone()
                 post_id = row["ID"] if row else None
 
-            # results создаём только для постов участников
             if post_id and not is_reviewer:
                 db.execute(
                     "INSERT OR IGNORE INTO results (Post, BotWords) VALUES (?,?)",
@@ -132,12 +132,11 @@ def _parse_page(url: str) -> dict | None:
     Возвращает:
       dict   — успешно
       None   — постоянная ошибка (404, нет автора) → ставить Parsed=1
-      raises — временная ошибка (таймаут, 5xx)    → НЕ ставить Parsed=1, попробуем позже
+      raises — временная ошибка (таймаут, 5xx)    → НЕ ставить Parsed=1
     """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
-    except (requests.Timeout, requests.ConnectionError) as e:
-        # Временная сетевая ошибка — пробрасываем наверх
+    except (requests.Timeout, requests.ConnectionError):
         raise
 
     try:
@@ -145,10 +144,8 @@ def _parse_page(url: str) -> dict | None:
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 0
         if status_code in (404, 410):
-            # Страница удалена — постоянная ошибка
             log.warning(f"[posts] Страница недоступна ({status_code}): {url}")
             return None
-        # 5xx, 429 и т.д. — временная ошибка
         raise
 
     resp.encoding = "utf-8"
@@ -195,20 +192,22 @@ def _parse_page(url: str) -> dict | None:
         return None
 
 
-def parse() -> dict[str, int]:
+def parse() -> list[int]:
     """
-    Парсит все ссылки с Parsed=0 и сохраняет посты в БД.
-    Возвращает dict {tgid: количество_новых_постов} для уведомлений.
+    Парсит все ссылки с Parsed=0, сохраняет посты в БД.
+    Возвращает список новых post_id для постов участников.
+
+    Назначение постов в очередь — на стороне вызывающего (scheduler.py).
     """
     day = _get_current_day()
     if not day:
         log.error("[posts] Нет активного дня в таблице days")
-        return {}
+        return []
 
     links                  = _get_unparsed_links()
     verified_reviewer_urls = _get_verified_reviewer_urls()
-    assigned: dict[str, int] = {}
-    parsed_urls: list[str]   = []
+    new_post_ids: list[int] = []
+    parsed_urls: list[str]  = []
 
     log.info(f"[posts] Ссылок для парсинга: {len(links)}, день: {day}")
 
@@ -218,13 +217,11 @@ def parse() -> dict[str, int]:
         try:
             post = _parse_page(url)
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            # Временная ошибка — оставляем Parsed=0, попробуем при следующем запуске
             log.warning(f"[posts] Временная ошибка, пропускаем: {url} — {e}")
             time.sleep(PAGE_PAUSE_POSTS)
             continue
 
         if not post:
-            # Постоянная ошибка (404, нет автора) — помечаем чтобы не трогать снова
             log.warning(f"[posts] Постоянная ошибка, помечаем Parsed=1: {url}")
             parsed_urls.append(url)
             continue
@@ -253,16 +250,10 @@ def parse() -> dict[str, int]:
         parsed_urls.append(url)
 
         if post_id:
-            tgid = assign_post(post_id)
-            if tgid:
-                # distributed — считаем по каждому жюри
-                assigned[tgid] = assigned.get(tgid, 0) + 1
-            else:
-                # open — считаем общее количество новых постов под ключом None
-                assigned[None] = assigned.get(None, 0) + 1
+            new_post_ids.append(post_id)
 
         time.sleep(PAGE_PAUSE_POSTS)
 
     _mark_links_parsed(parsed_urls)
-    log.info(f"[posts] Помечено Parsed=1: {len(parsed_urls)}, новых в очереди: {sum(assigned.values())}")
-    return assigned
+    log.info(f"[posts] Помечено Parsed=1: {len(parsed_urls)}, новых постов: {len(new_post_ids)}")
+    return new_post_ids

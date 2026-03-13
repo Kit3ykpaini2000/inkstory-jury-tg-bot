@@ -5,18 +5,17 @@ bot/handlers/admin.py — хендлеры админ панели
 """
 
 import os
-import sys
 import pathlib
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 from utils.database import get_db
 from utils.config import QUEUE_MODE
 from utils.logger import setup_logger
-from parser.queue_manager import (
-    get_total_queue_count, get_all_reviewer_queue_sizes, assign_post,
-)
+from utils.constants import PostStatus
+from utils.db_helpers import is_admin
+from parser.queue_manager import get_total_queue_count, get_all_reviewer_queue_sizes
 from bot.keyboards import (
     admin_keyboard, back_keyboard, logs_keyboard,
     queue_mode_keyboard, verify_list_keyboard,
@@ -30,21 +29,13 @@ WAITING_SHUTDOWN_REASON = 100
 
 # ── Хелперы ───────────────────────────────────────────────────────────────────
 
-def _is_admin(tg_id: str) -> bool:
-    with get_db() as db:
-        row = db.execute(
-            "SELECT IsAdmin FROM reviewers WHERE TGID=?", (tg_id,)
-        ).fetchone()
-        return row is not None and row["IsAdmin"] == 1
-
-
 def _get_stats() -> dict:
     with get_db() as db:
         checked  = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status='done'"
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.DONE,)
         ).fetchone()[0]
         rejected = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status='rejected'"
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.REJECTED,)
         ).fetchone()[0]
         reviewers = db.execute(
             "SELECT COUNT(*) FROM reviewers"
@@ -65,13 +56,14 @@ def _get_reviewer_stats() -> list:
             SELECT
                 rv.Name,
                 COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked,
-                COUNT(CASE WHEN p.Status='rejected' AND r.Reviewer=rv.TGID THEN 1 END) AS rejected
+                COUNT(CASE WHEN p.Status=? AND r.Reviewer=rv.TGID THEN 1 END) AS rejected
             FROM reviewers rv
             LEFT JOIN results    r ON r.Reviewer = rv.TGID
             LEFT JOIN posts_info p ON p.ID = r.Post
             GROUP BY rv.TGID
             ORDER BY checked DESC
-            """
+            """,
+            (PostStatus.REJECTED,),
         ).fetchall()
 
 
@@ -90,11 +82,11 @@ def _get_all_reviewers() -> list[dict]:
         ).fetchall()
     return [
         {
-            "tgid":      r["TGID"],
-            "name":      r["Name"],
-            "verified":  bool(r["Verified"]),
-            "is_admin":  bool(r["IsAdmin"]),
-            "checked":   r["checked"],
+            "tgid":     r["TGID"],
+            "name":     r["Name"],
+            "verified": bool(r["Verified"]),
+            "is_admin": bool(r["IsAdmin"]),
+            "checked":  r["checked"],
         }
         for r in rows
     ]
@@ -133,7 +125,7 @@ def _build_verify_text(reviewers: list[dict]) -> str:
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    if not _is_admin(tg_id):
+    if not is_admin(tg_id):
         await update.message.reply_text("У тебя нет прав администратора.")
         return
     await update.message.reply_text(
@@ -152,7 +144,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.startswith(("admin_", "logs_", "qmode_")):
         return
 
-    if not _is_admin(tg_id):
+    if not is_admin(tg_id):
         await query.answer()
         return
 
@@ -196,16 +188,16 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Режим очереди ─────────────────────────────────────────────────────────
     elif data == "admin_queue_mode":
-        mode = QUEUE_MODE
         await query.edit_message_text(
-            f"⚙️ Режим очереди (текущий: {mode}):",
-            reply_markup=queue_mode_keyboard(mode),
+            f"⚙️ Режим очереди (текущий: {QUEUE_MODE}):",
+            reply_markup=queue_mode_keyboard(QUEUE_MODE),
         )
 
-    elif data in ("qmode_open", "qmode_distributed", "qmode_balanced"):
-        new_mode = data.replace("qmode_", "")
+    elif data in ("qmode_open", "qmode_balanced"):
         await query.edit_message_text(
-            f"⚙️ Режим очереди нельзя изменить через бота.\n\nИзмени QUEUE_MODE в файле .env и перезапусти бота.\n\nТекущий режим: {QUEUE_MODE}",
+            f"⚙️ Режим очереди нельзя изменить через бота.\n\n"
+            f"Измени QUEUE_MODE в файле .env и перезапусти бота.\n\n"
+            f"Текущий режим: {QUEUE_MODE}",
             reply_markup=back_keyboard(),
         )
 
@@ -237,14 +229,6 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("admin_verify_"):
         target_id = data.replace("admin_verify_", "")
         _set_verified(target_id, 1)
-        # Назначаем ему посты если режим distributed
-        if QUEUE_MODE == "distributed":
-            with get_db() as db:
-                free = db.execute(
-                    "SELECT Post FROM queue WHERE Reviewer IS NULL LIMIT 10"
-                ).fetchall()
-            for row in free:
-                assign_post(row["Post"])
         log.info(f"[admin] Верифицирован {target_id}")
         try:
             await context.bot.send_message(
@@ -291,11 +275,9 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if not _is_admin(str(query.from_user.id)):
+    if not is_admin(str(query.from_user.id)):
         return ConversationHandler.END
-    await query.message.reply_text(
-        "🔴 Введи причину выключения бота:"
-    )
+    await query.message.reply_text("🔴 Введи причину выключения бота:")
     return WAITING_SHUTDOWN_REASON
 
 
@@ -303,7 +285,7 @@ async def got_shutdown_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_id  = str(update.effective_user.id)
     reason = update.message.text.strip()
 
-    if not _is_admin(tg_id):
+    if not is_admin(tg_id):
         return ConversationHandler.END
 
     log.info(f"[admin] Выключение бота. Причина: {reason}")
