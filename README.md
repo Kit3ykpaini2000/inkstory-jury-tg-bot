@@ -1,4 +1,4 @@
-# inkstory-bot
+# inkstory-jury-tg-bot
 
 Telegram-бот для организации литературного конкурса на [inkstory.net](https://inkstory.net).  
 Парсит посты участников, распределяет их по жюри и собирает результаты проверки.
