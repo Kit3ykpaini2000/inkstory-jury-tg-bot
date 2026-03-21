@@ -67,6 +67,20 @@ def get_full_stats(user: dict = Depends(get_verified_user)):
     }
 
 
+@router.get("/active")
+def get_active_post_route(user: dict = Depends(get_verified_user)):
+    """Возвращает текущий активный пост если есть, иначе 404."""
+    post = get_active_post(user["tg_id"])
+    if not post:
+        raise HTTPException(status_code=404, detail="No active post")
+    return {
+        "post_id":   post["post_id"],
+        "url":       post["url"],
+        "author":    post["author"],
+        "bot_words": post["bot_words"],
+    }
+
+
 @router.get("/next")
 def get_next_post(user: dict = Depends(get_verified_user)):
     """

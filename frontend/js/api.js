@@ -44,6 +44,7 @@ export const api = {
   // ── Жюри ──
   getMe()              { return request('GET',  '/api/jury/me'); },
   getFullStats()       { return request('GET',  '/api/jury/stats'); },
+  getActivePost()      { return request('GET',  '/api/jury/active'); },
   getNextPost()        { return request('GET',  '/api/jury/next'); },
   getPostText()        { return request('GET',  '/api/jury/post-text'); },
   submitResult(w, e)   { return request('POST', '/api/jury/submit',  { words: w, errors: e }); },

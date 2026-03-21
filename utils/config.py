@@ -28,6 +28,10 @@ def _str(key: str, default: str) -> str:
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
+# ── Туннель ───────────────────────────────────────────────────────────────────
+
+TUNNEL_PROVIDER: str = _str("TUNNEL_PROVIDER", "cloudflare")  # cloudflare | xtunnel
+
 # ── Парсер ────────────────────────────────────────────────────────────────────
 
 PARSER_INTERVAL: int   = _int("PARSER_INTERVAL", 30) * 60   # минуты → секунды

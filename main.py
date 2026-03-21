@@ -1,5 +1,5 @@
 """
-main.py — точка входа: бот + FastAPI + cloudflared + планировщик
+main.py — точка входа: бот + FastAPI + туннель + планировщик
 
 Запуск: python main.py
 """
@@ -32,6 +32,7 @@ from utils.config import (
     BOT_TOKEN, PARSER_INTERVAL, EXPIRE_CHECK_INTERVAL,
     FINAL_PARSER_HOUR, FINAL_PARSER_MINUTE,
     NEW_DAY_HOUR, NEW_DAY_MINUTE,
+    TUNNEL_PROVIDER,
     validate as validate_config,
 )
 from utils.logger import setup_logger
@@ -61,13 +62,10 @@ log       = setup_logger()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
-# ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
+# ── Туннели ───────────────────────────────────────────────────────────────────
 
-def _start_cloudflared() -> str | None:
-    """
-    Запускает cloudflared tunnel и возвращает публичный HTTPS URL.
-    Парсит URL из вывода процесса (появляется в stderr за ~3-5 сек).
-    """
+def _start_cloudflare() -> str | None:
+    """Запускает trycloudflare и возвращает публичный URL."""
     try:
         proc = subprocess.Popen(
             ["cloudflared", "tunnel", "--url", "http://localhost:8000"],
@@ -75,8 +73,6 @@ def _start_cloudflared() -> str | None:
             stderr=subprocess.PIPE,
             text=True,
         )
-
-        # Ждём URL в stderr (cloudflared пишет туда)
         deadline = time.time() + 30
         url = None
         while time.time() < deadline:
@@ -88,35 +84,66 @@ def _start_cloudflared() -> str | None:
             if match:
                 url = match.group(0)
                 break
-
         if url:
-            log.info(f"[cloudflared] Туннель активен: {url}")
-            # Держим процесс живым в фоне
-            threading.Thread(
-                target=lambda: proc.wait(),
-                daemon=True,
-                name="cloudflared-proc"
-            ).start()
+            threading.Thread(target=lambda: proc.wait(), daemon=True, name="cloudflare-proc").start()
         else:
-            log.warning("[cloudflared] Не удалось получить URL за 30 сек")
+            log.warning("[tunnel] cloudflare: не удалось получить URL за 30 сек")
             proc.terminate()
-
         return url
-
     except FileNotFoundError:
-        log.error("[cloudflared] cloudflared не найден. Установи: sudo dpkg -i cloudflared.deb")
+        log.error("[tunnel] cloudflared не найден")
         return None
     except Exception as e:
-        log.error(f"[cloudflared] Ошибка запуска: {e}")
+        log.error(f"[tunnel] cloudflare ошибка: {e}")
         return None
+
+
+def _start_xtunnel() -> str | None:
+    """Запускает xtunnel и возвращает публичный URL."""
+    try:
+        proc = subprocess.Popen(
+            ["xtunnel", "http", "8000"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.time() + 30
+        url = None
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            match = re.search(r"https://[\w\-]+\.tunnel4\.com", line)
+            if match:
+                url = match.group(0)
+                break
+        if url:
+            threading.Thread(target=lambda: proc.wait(), daemon=True, name="xtunnel-proc").start()
+        else:
+            log.warning("[tunnel] xtunnel: не удалось получить URL за 30 сек")
+            proc.terminate()
+        return url
+    except FileNotFoundError:
+        log.error("[tunnel] xtunnel не найден. Скачай с xtunnel.ru")
+        return None
+    except Exception as e:
+        log.error(f"[tunnel] xtunnel ошибка: {e}")
+        return None
+
+
+def _start_tunnel() -> str | None:
+    """Запускает туннель согласно TUNNEL_PROVIDER из .env."""
+    if TUNNEL_PROVIDER == "xtunnel":
+        log.info("[tunnel] Запуск xtunnel...")
+        return _start_xtunnel()
+    else:
+        log.info("[tunnel] Запуск cloudflare...")
+        return _start_cloudflare()
 
 
 def _update_mini_app_url(url: str) -> bool:
-    """
-    Обновляет URL Mini App для всех пользователей через Bot API.
-    Вызывает setChatMenuButton глобально + для каждого верифицированного жюри.
-    """
-    from utils.db.jury import get_all_verified_ids
+    """Обновляет URL Mini App для всех пользователей через Bot API."""
     menu_button = {
         "type": "web_app",
         "text": "Открыть панель",
@@ -124,7 +151,6 @@ def _update_mini_app_url(url: str) -> bool:
     }
     ok = False
     try:
-        # Глобальная кнопка (для новых пользователей)
         resp = req.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
             json={"menu_button": menu_button},
@@ -133,7 +159,6 @@ def _update_mini_app_url(url: str) -> bool:
         if resp.json().get("ok"):
             ok = True
 
-        # Для каждого жюри персонально (обновляет кешированную кнопку)
         try:
             tg_ids = get_all_verified_ids()
         except Exception:
@@ -149,20 +174,22 @@ def _update_mini_app_url(url: str) -> bool:
             except Exception:
                 pass
 
-        log.info(f"[cloudflared] Mini App URL обновлён для {len(tg_ids)} пользователей: {url}")
+        log.info(f"[tunnel] Mini App URL обновлён для {len(tg_ids)} пользователей: {url}")
         return ok
     except Exception as e:
-        log.error(f"[cloudflared] Ошибка обновления URL: {e}")
+        log.error(f"[tunnel] Ошибка обновления URL: {e}")
         return False
 
 
-def start_tunnel() -> str | None:
-    """Запускает туннель и обновляет Mini App URL. Возвращает публичный URL."""
-    log.info("[cloudflared] Запуск туннеля...")
-    url = _start_cloudflared()
+def start_tunnel(app=None):
+    url = _start_tunnel()
     if url:
         _update_mini_app_url(url)
-    return url
+        # Сохраняем URL для использования при верификации новых жюри
+        import os
+        os.environ["_TUNNEL_URL"] = url
+        if app is not None:
+            app.bot_data["tunnel_url"] = url
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -177,16 +204,11 @@ def _run_api():
 
 async def on_startup(app):
     log.info("Бот запущен")
-    # Ждём пока туннель поднимется и URL обновится
-    import asyncio
-    await asyncio.sleep(8)
-    tunnel_url = getattr(app, '_tunnel_url', None)
     for tg_id in get_all_verified_ids():
         try:
-            text = "🟢 Бот запущен и готов к работе!"
-            if tunnel_url:
-                text += f"\n\n🔗 Новая ссылка на панель:\n{tunnel_url}"
-            await app.bot.send_message(chat_id=tg_id, text=text)
+            await app.bot.send_message(
+                chat_id=tg_id, text="🟢 Бот запущен и готов к работе!"
+            )
         except Exception:
             pass
 
@@ -208,16 +230,14 @@ def run():
         sys.exit(1)
 
     log.info("=" * 50)
-    log.info("Запуск бота + API")
+    log.info(f"Запуск бота + API [{TUNNEL_PROVIDER}]")
     log.info("=" * 50)
 
-    # 1. FastAPI в фоновом потоке
     threading.Thread(target=_run_api, daemon=True, name="fastapi").start()
     log.info("[api] FastAPI запущен на http://0.0.0.0:8000")
 
-    # 2. Ждём пока FastAPI поднимется, потом запускаем туннель
     time.sleep(2)
-    threading.Thread(target=start_tunnel, daemon=True, name="cloudflared").start()
+    threading.Thread(target=lambda: start_tunnel(app), daemon=True, name="tunnel").start()
 
     app = (
         ApplicationBuilder()
@@ -227,7 +247,6 @@ def run():
         .build()
     )
 
-    # ── Хендлеры ─────────────────────────────────────────────────────────────
     reg_handler = ConversationHandler(
         entry_points=[CommandHandler("register", cmd_register)],
         states={
@@ -291,7 +310,6 @@ def run():
     app.add_handler(CommandHandler("admin",     cmd_admin))
     app.add_handler(CallbackQueryHandler(cb_admin))
 
-    # ── Планировщик ───────────────────────────────────────────────────────────
     jq = app.job_queue
     jq.run_repeating(job_auto_parser,   interval=PARSER_INTERVAL,       first=60, name="auto_parser")
     jq.run_repeating(job_check_expired, interval=EXPIRE_CHECK_INTERVAL, first=60, name="check_expired")

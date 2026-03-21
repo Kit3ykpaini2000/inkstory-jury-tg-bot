@@ -158,6 +158,24 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_verified(target_id, 1)
         log.info(f"[admin] Верифицирован {target_id}")
         try:
+            # Обновляем кнопку Mini App для нового жюри
+            from utils.config import BOT_TOKEN
+            import requests as _req
+            _req.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+                json={
+                    "chat_id": target_id,
+                    "menu_button": {
+                        "type": "web_app",
+                        "text": "Открыть панель",
+                        "web_app": {"url": context.bot_data.get("tunnel_url", "")},
+                    }
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
+        try:
             await context.bot.send_message(
                 chat_id=target_id,
                 text="✅ Твоя учётная запись верифицирована!\n\nТеперь ты можешь получать посты через /next."

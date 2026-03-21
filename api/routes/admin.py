@@ -61,6 +61,29 @@ def list_reviewers(user: dict = Depends(get_admin_user)):
 def verify_reviewer(tgid: str, user: dict = Depends(get_admin_user)):
     set_verified(tgid, 1)
     log.info(f"[api/admin] Верифицирован {tgid} (by {user['tg_id']})")
+    # Обновляем кнопку Mini App для нового жюри
+    try:
+        from utils.config import BOT_TOKEN
+        import requests as _req
+        import pathlib, os
+        from dotenv import load_dotenv
+        load_dotenv(pathlib.Path(__file__).parent.parent.parent / ".env")
+        tunnel_url = os.getenv("_TUNNEL_URL", "")
+        if tunnel_url:
+            _req.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+                json={
+                    "chat_id": tgid,
+                    "menu_button": {
+                        "type": "web_app",
+                        "text": "Открыть панель",
+                        "web_app": {"url": tunnel_url},
+                    }
+                },
+                timeout=5,
+            )
+    except Exception:
+        pass
     return {"ok": True}
 
 

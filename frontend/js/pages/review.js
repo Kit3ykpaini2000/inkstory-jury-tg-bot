@@ -26,13 +26,12 @@ export function renderReview(container) {
 }
 
 export async function onReviewActivate() {
+  // Только проверяем есть ли уже активный пост
+  // Новый пост берётся ТОЛЬКО по кнопке "Взять пост"
   try {
-    const post = await api.getNextPost();
+    const post = await api.getActivePost();
     setPost(post);
   } catch (e) {
-    if (e.message !== 'No posts available' && e.message !== 'No active post') {
-      showToast('Ошибка: ' + e.message);
-    }
     clearPost();
   }
 }
