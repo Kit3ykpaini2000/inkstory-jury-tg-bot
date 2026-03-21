@@ -4,9 +4,10 @@ parser/posts.py — парсинг постов через requests + BeautifulS
 Логика:
 1. Берём ссылки с Parsed=0 из таблицы links
 2. Загружаем страницу, извлекаем автора и текст
-3. Если автор — верифицированный жюри → Status=reviewer_post, в очередь не идёт
-4. Иначе → Status=pending, сохраняем в БД
-5. Помечаем ссылку Parsed=1 только после успешного сохранения
+3. Считаем bot_words на лету — текст НЕ сохраняется в БД
+4. Если автор — верифицированный жюри → Status=reviewer_post, в очередь не идёт
+5. Иначе → Status=pending, сохраняем в БД (без Text)
+6. Помечаем ссылку Parsed=1 только после успешного сохранения
 
 Назначение постов в очередь (assign_post) выполняется в scheduler.py,
 не здесь — parse() возвращает список новых post_id.
@@ -21,6 +22,7 @@ from utils.config import PAGE_PAUSE_POSTS
 from utils.logger import setup_logger
 from utils.word_counter import count_words
 from utils.constants import PostStatus
+from utils.db.days import get_current_day
 
 log = setup_logger()
 
@@ -48,12 +50,6 @@ def _get_verified_reviewer_urls() -> set[str]:
         ).fetchall()}
 
 
-def _get_current_day() -> int | None:
-    with get_db() as db:
-        row = db.execute("SELECT MAX(Day) FROM days").fetchone()
-        return row[0] if row and row[0] else None
-
-
 def _mark_links_parsed(urls: list[str]) -> None:
     if not urls:
         return
@@ -69,13 +65,12 @@ def _save_post(
     url: str,
     author_name: str,
     author_url: str,
-    text: str,
     day: int,
     bot_words: int,
     is_reviewer: bool,
 ) -> int | None:
     """
-    Сохраняет пост атомарно.
+    Сохраняет пост атомарно. Текст не хранится — только метаданные.
     Возвращает post_id для постов участников или None для постов жюри/ошибки.
     """
     status = PostStatus.REVIEWER_POST if is_reviewer else PostStatus.PENDING
@@ -97,10 +92,10 @@ def _save_post(
 
             cur = db.execute(
                 """
-                INSERT OR IGNORE INTO posts_info (Author, URL, Text, Day, Status)
-                VALUES (?,?,?,?,?)
+                INSERT OR IGNORE INTO posts_info (Author, URL, Day, Status)
+                VALUES (?,?,?,?)
                 """,
-                (author_id, url, text, day, status),
+                (author_id, url, day, status),
             )
             post_id = cur.lastrowid
 
@@ -123,6 +118,38 @@ def _save_post(
             db.execute("ROLLBACK")
             log.error(f"[posts] Ошибка сохранения {url}: {e}")
             return None
+
+
+def fetch_post_text(url: str) -> str | None:
+    """
+    Загружает текст поста на лету по URL.
+    Используется для AI-проверки и подсчёта слов без хранения в БД.
+    """
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        text = ""
+        for selector in [
+            "div.prose.prose-sm p.max-w-full",
+            "div.prose p",
+            "div.prose",
+        ]:
+            blocks = soup.select(selector)
+            if blocks:
+                text = "\n".join(
+                    b.get_text(strip=True) for b in blocks if b.get_text(strip=True)
+                )
+                if text:
+                    break
+
+        return text or None
+
+    except Exception as e:
+        log.error(f"[posts] Ошибка загрузки текста {url}: {e}")
+        return None
 
 
 def _parse_page(url: str) -> dict | None:
@@ -194,12 +221,13 @@ def _parse_page(url: str) -> dict | None:
 
 def parse() -> list[int]:
     """
-    Парсит все ссылки с Parsed=0, сохраняет посты в БД.
+    Парсит все ссылки с Parsed=0, сохраняет посты в БД (без текста).
+    Считает bot_words на лету, сохраняет только число.
     Возвращает список новых post_id для постов участников.
 
     Назначение постов в очередь — на стороне вызывающего (scheduler.py).
     """
-    day = _get_current_day()
+    day = get_current_day()
     if not day:
         log.error("[posts] Нет активного дня в таблице days")
         return []
@@ -227,7 +255,7 @@ def parse() -> list[int]:
             continue
 
         is_reviewer = post["author_url"] in verified_reviewer_urls
-        bot_words   = count_words(post["text"])
+        bot_words   = count_words(post["text"])  # считаем на лету, текст не сохраняем
 
         if is_reviewer:
             log.info(f"[posts] Пост жюри — пропускаем очередь: {post['author_name']}")
@@ -236,7 +264,6 @@ def parse() -> list[int]:
             url=url,
             author_name=post["author_name"],
             author_url=post["author_url"],
-            text=post["text"],
             day=day,
             bot_words=bot_words,
             is_reviewer=is_reviewer,

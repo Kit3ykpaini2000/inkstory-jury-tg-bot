@@ -1,32 +1,7 @@
-# Окружение
-.env
 venv/
-.venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-
-# БД и данные
-data/main.db
-data/*.db
-data/*.db-wal
-data/*.db-shm
-
-# Логи
-logs/
 *.log
-
-# Результаты экспорта
-results/
-
-# IDE
+.env
+data/
 .idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+results/

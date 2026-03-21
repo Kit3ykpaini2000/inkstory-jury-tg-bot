@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from utils.database import get_db
 from utils.logger import setup_logger
-from utils.db_helpers import get_all_verified_ids
+from utils.db.jury import get_all_verified_ids
 from parser.queue_manager import (
     assign_post, release_expired_posts, get_free_posts_count,
 )

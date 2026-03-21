@@ -53,10 +53,10 @@ NEW_DAY_MINUTE: int      = _int("NEW_DAY_MINUTE", 1)         # минута см
 MAX_WORDS: int  = _int("MAX_WORDS",  100_000)  # максимум слов при вводе
 MAX_ERRORS: int = _int("MAX_ERRORS", 10_000)   # максимум ошибок при вводе
 
-# ── Groq AI ───────────────────────────────────────────────────────────────────
+# ── GitHub Models AI ──────────────────────────────────────────────────────────
 
-GROQ_API_KEY: str    = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL: str      = _str("GROQ_MODEL", "llama-3.3-70b-versatile")
+GITHUB_TOKEN: str    = os.getenv("GITHUB_TOKEN", "")
+GITHUB_MODEL: str    = _str("GITHUB_MODEL", "gpt-4o-mini")
 AI_CHUNK_SIZE: int   = _int("AI_CHUNK_SIZE", 3000)  # символов на один запрос
 
 

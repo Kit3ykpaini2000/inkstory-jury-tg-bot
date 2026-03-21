@@ -10,11 +10,10 @@ import pathlib
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
-from utils.database import get_db
 from utils.config import QUEUE_MODE
 from utils.logger import setup_logger
-from utils.constants import PostStatus
-from utils.db_helpers import is_admin
+from utils.db.jury import is_admin, get_all_reviewers, get_reviewer_stats, set_verified
+from utils.db.posts import get_posts_stats
 from parser.queue_manager import get_total_queue_count, get_all_reviewer_queue_sizes
 from bot.keyboards import (
     admin_keyboard, back_keyboard, logs_keyboard,
@@ -28,77 +27,6 @@ WAITING_SHUTDOWN_REASON = 100
 
 
 # ── Хелперы ───────────────────────────────────────────────────────────────────
-
-def _get_stats() -> dict:
-    with get_db() as db:
-        checked  = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.DONE,)
-        ).fetchone()[0]
-        rejected = db.execute(
-            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.REJECTED,)
-        ).fetchone()[0]
-        reviewers = db.execute(
-            "SELECT COUNT(*) FROM reviewers"
-        ).fetchone()[0]
-    return {
-        "in_queue":  get_total_queue_count(),
-        "checked":   checked,
-        "rejected":  rejected,
-        "reviewers": reviewers,
-        "mode":      QUEUE_MODE,
-    }
-
-
-def _get_reviewer_stats() -> list:
-    with get_db() as db:
-        return db.execute(
-            """
-            SELECT
-                rv.Name,
-                COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked,
-                COUNT(CASE WHEN p.Status=? AND r.Reviewer=rv.TGID THEN 1 END) AS rejected
-            FROM reviewers rv
-            LEFT JOIN results    r ON r.Reviewer = rv.TGID
-            LEFT JOIN posts_info p ON p.ID = r.Post
-            GROUP BY rv.TGID
-            ORDER BY checked DESC
-            """,
-            (PostStatus.REJECTED,),
-        ).fetchall()
-
-
-def _get_all_reviewers() -> list[dict]:
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT TGID, Name, COALESCE(Verified,0) AS Verified,
-                   COALESCE(IsAdmin,0) AS IsAdmin,
-                   COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked
-            FROM reviewers rv
-            LEFT JOIN results r ON r.Reviewer = rv.TGID
-            GROUP BY rv.TGID
-            ORDER BY Verified ASC, Name ASC
-            """
-        ).fetchall()
-    return [
-        {
-            "tgid":     r["TGID"],
-            "name":     r["Name"],
-            "verified": bool(r["Verified"]),
-            "is_admin": bool(r["IsAdmin"]),
-            "checked":  r["checked"],
-        }
-        for r in rows
-    ]
-
-
-def _set_verified(tg_id: str, value: int) -> None:
-    with get_db() as db:
-        db.execute(
-            "UPDATE reviewers SET Verified=? WHERE TGID=?", (value, tg_id)
-        )
-        db.commit()
-
 
 def _get_log_lines(n: int) -> str:
     try:
@@ -152,14 +80,13 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Статистика ────────────────────────────────────────────────────────────
     if data == "admin_stats":
-        s = _get_stats()
+        s = get_posts_stats()
         await query.edit_message_text(
             f"📊 Статистика:\n\n"
-            f"📋 В очереди: {s['in_queue']}\n"
-            f"✅ Проверено: {s['checked']}\n"
+            f"📋 В очереди: {get_total_queue_count()}\n"
+            f"✅ Проверено: {s['done']}\n"
             f"❌ Отклонено: {s['rejected']}\n"
-            f"👥 Проверяющих: {s['reviewers']}\n"
-            f"⚙️ Режим: {s['mode']}",
+            f"⚙️ Режим: {QUEUE_MODE}",
             reply_markup=back_keyboard(),
         )
 
@@ -177,7 +104,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Проверяющие ───────────────────────────────────────────────────────────
     elif data == "admin_reviewers":
-        rows = _get_reviewer_stats()
+        rows = get_reviewer_stats()
         if not rows:
             text = "👥 Проверяющих нет."
         else:
@@ -220,7 +147,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Верификация ───────────────────────────────────────────────────────────
     elif data == "admin_verify":
-        reviewers = _get_all_reviewers()
+        reviewers = get_all_reviewers()
         await query.edit_message_text(
             _build_verify_text(reviewers),
             reply_markup=verify_list_keyboard(reviewers),
@@ -228,7 +155,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("admin_verify_"):
         target_id = data.replace("admin_verify_", "")
-        _set_verified(target_id, 1)
+        set_verified(target_id, 1)
         log.info(f"[admin] Верифицирован {target_id}")
         try:
             await context.bot.send_message(
@@ -238,7 +165,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.answer("✅ Верифицирован!")
-        reviewers = _get_all_reviewers()
+        reviewers = get_all_reviewers()
         await query.edit_message_text(
             _build_verify_text(reviewers),
             reply_markup=verify_list_keyboard(reviewers),
@@ -246,7 +173,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("admin_unverify_"):
         target_id = data.replace("admin_unverify_", "")
-        _set_verified(target_id, 0)
+        set_verified(target_id, 0)
         log.info(f"[admin] Отозвана верификация {target_id}")
         try:
             await context.bot.send_message(
@@ -256,7 +183,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.answer("❌ Верификация отозвана!")
-        reviewers = _get_all_reviewers()
+        reviewers = get_all_reviewers()
         await query.edit_message_text(
             _build_verify_text(reviewers),
             reply_markup=verify_list_keyboard(reviewers),
@@ -282,6 +209,7 @@ async def cmd_shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def got_shutdown_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from utils.db.jury import get_all_verified_ids
     tg_id  = str(update.effective_user.id)
     reason = update.message.text.strip()
 
@@ -290,19 +218,14 @@ async def got_shutdown_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     log.info(f"[admin] Выключение бота. Причина: {reason}")
 
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT TGID FROM reviewers WHERE Verified=1"
-        ).fetchall()
-
     text = (
         f"🔴 Бот выключается.\n\n"
         f"📋 Причина: {reason}\n\n"
         f"Бот будет недоступен до следующего запуска."
     )
-    for row in rows:
+    for tg in get_all_verified_ids():
         try:
-            await context.bot.send_message(chat_id=row["TGID"], text=text)
+            await context.bot.send_message(chat_id=tg, text=text)
         except Exception:
             pass
 

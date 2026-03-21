@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="color-scheme" content="light dark">
+  <title>inkstory — панель жюри</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Шапка -->
+  <div class="top-bar">
+    <div class="top-bar-avatar">IS</div>
+    <div>
+      <div class="top-bar-title">inkstory</div>
+      <div class="top-bar-sub">панель жюри</div>
+    </div>
+    <button class="top-bar-theme" id="btn-theme">🌙</button>
+  </div>
+
+  <!-- Страницы -->
+  <div class="pages">
+    <div class="page" id="page-review"></div>
+    <div class="page" id="page-stats"></div>
+    <div class="page" id="page-admin"></div>
+  </div>
+
+  <!-- Плавающие кнопки действий (показываются только при активном посте) -->
+  <div class="float-bar hidden" id="float-bar">
+    <button class="fab fab-reject" id="fab-reject">✕ Отклонить</button>
+    <button class="fab fab-skip"   id="fab-skip">⏭ Пропустить</button>
+    <button class="fab fab-accept" id="fab-accept">✓ Принять</button>
+  </div>
+
+  <!-- Нижняя навигация -->
+  <nav class="bottom-nav">
+    <button class="nav-item" id="nav-review">
+      <span class="nav-icon">📝</span>
+      Проверка
+    </button>
+    <button class="nav-item" id="nav-stats">
+      <span class="nav-icon">📊</span>
+      Статистика
+    </button>
+    <button class="nav-item" id="nav-admin">
+      <span class="nav-icon">⚙️</span>
+      Админ
+    </button>
+  </nav>
+
+</div>
+
+<!-- Боковая панель -->
+<div class="drawer-overlay" id="drawer-overlay"></div>
+<div class="drawer" id="drawer">
+  <button class="drawer-close" id="drawer-close">✕</button>
+  <div class="drawer-title" id="drawer-title">Действие</div>
+  <div class="drawer-sub"   id="drawer-sub"></div>
+  <div id="drawer-body"></div>
+  <button class="drawer-confirm" id="drawer-confirm">Подтвердить</button>
+</div>
+
+<!-- Toast уведомление -->
+<div class="toast" id="toast"></div>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

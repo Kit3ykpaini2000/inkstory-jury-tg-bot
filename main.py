@@ -1,11 +1,16 @@
 """
-main.py — точка входа бота
+main.py — точка входа: бот + FastAPI + cloudflared + планировщик
 
 Запуск: python main.py
 """
 
+import re
 import sys
+import time
+import threading
+import subprocess
 import pathlib
+import requests as req
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from datetime import time as dtime
@@ -30,14 +35,18 @@ from utils.config import (
     validate as validate_config,
 )
 from utils.logger import setup_logger
-from utils.db_helpers import get_all_verified_ids, release_stuck_posts
+from utils.db.jury import get_all_verified_ids
+from utils.db.posts import release_stuck_posts
 
-from bot.handlers.user import (
-    cmd_start, cmd_register, cmd_next, cmd_cancel, cmd_stats, cmd_fullstats,
-    got_reg_url, got_words, got_errors,
+from bot.handlers.common import (
+    cmd_start, cmd_register, cmd_stats, cmd_fullstats,
+    got_reg_url, WAITING_REG_URL,
+)
+from bot.handlers.review import (
+    cmd_next, cmd_cancel, got_words, got_errors,
     got_skip_text, got_reject_custom,
     cb_skip_post, cb_skip_cancel, cb_reject_post, cb_reject_reason, cb_ai_check,
-    WAITING_REG_URL, WAITING_WORDS, WAITING_ERRORS,
+    WAITING_WORDS, WAITING_ERRORS,
     WAITING_SKIP_TEXT, WAITING_REJECT_REASON, WAITING_REJECT_CUSTOM,
 )
 from bot.handlers.admin import (
@@ -52,15 +61,132 @@ log       = setup_logger()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
+# ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
+
+def _start_cloudflared() -> str | None:
+    """
+    Запускает cloudflared tunnel и возвращает публичный HTTPS URL.
+    Парсит URL из вывода процесса (появляется в stderr за ~3-5 сек).
+    """
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", "http://localhost:8000"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Ждём URL в stderr (cloudflared пишет туда)
+        deadline = time.time() + 30
+        url = None
+        while time.time() < deadline:
+            line = proc.stderr.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            match = re.search(r"https://[\w\-]+\.trycloudflare\.com", line)
+            if match:
+                url = match.group(0)
+                break
+
+        if url:
+            log.info(f"[cloudflared] Туннель активен: {url}")
+            # Держим процесс живым в фоне
+            threading.Thread(
+                target=lambda: proc.wait(),
+                daemon=True,
+                name="cloudflared-proc"
+            ).start()
+        else:
+            log.warning("[cloudflared] Не удалось получить URL за 30 сек")
+            proc.terminate()
+
+        return url
+
+    except FileNotFoundError:
+        log.error("[cloudflared] cloudflared не найден. Установи: sudo dpkg -i cloudflared.deb")
+        return None
+    except Exception as e:
+        log.error(f"[cloudflared] Ошибка запуска: {e}")
+        return None
+
+
+def _update_mini_app_url(url: str) -> bool:
+    """
+    Обновляет URL Mini App для всех пользователей через Bot API.
+    Вызывает setChatMenuButton глобально + для каждого верифицированного жюри.
+    """
+    from utils.db.jury import get_all_verified_ids
+    menu_button = {
+        "type": "web_app",
+        "text": "Открыть панель",
+        "web_app": {"url": url},
+    }
+    ok = False
+    try:
+        # Глобальная кнопка (для новых пользователей)
+        resp = req.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+            json={"menu_button": menu_button},
+            timeout=10,
+        )
+        if resp.json().get("ok"):
+            ok = True
+
+        # Для каждого жюри персонально (обновляет кешированную кнопку)
+        try:
+            tg_ids = get_all_verified_ids()
+        except Exception:
+            tg_ids = []
+
+        for tg_id in tg_ids:
+            try:
+                req.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+                    json={"chat_id": tg_id, "menu_button": menu_button},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        log.info(f"[cloudflared] Mini App URL обновлён для {len(tg_ids)} пользователей: {url}")
+        return ok
+    except Exception as e:
+        log.error(f"[cloudflared] Ошибка обновления URL: {e}")
+        return False
+
+
+def start_tunnel() -> str | None:
+    """Запускает туннель и обновляет Mini App URL. Возвращает публичный URL."""
+    log.info("[cloudflared] Запуск туннеля...")
+    url = _start_cloudflared()
+    if url:
+        _update_mini_app_url(url)
+    return url
+
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+def _run_api():
+    import uvicorn
+    from api.app import app as fastapi_app
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, log_level="warning")
+
+
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 
 async def on_startup(app):
     log.info("Бот запущен")
+    # Ждём пока туннель поднимется и URL обновится
+    import asyncio
+    await asyncio.sleep(8)
+    tunnel_url = getattr(app, '_tunnel_url', None)
     for tg_id in get_all_verified_ids():
         try:
-            await app.bot.send_message(
-                chat_id=tg_id, text="🟢 Бот запущен и готов к работе!"
-            )
+            text = "🟢 Бот запущен и готов к работе!"
+            if tunnel_url:
+                text += f"\n\n🔗 Новая ссылка на панель:\n{tunnel_url}"
+            await app.bot.send_message(chat_id=tg_id, text=text)
         except Exception:
             pass
 
@@ -82,8 +208,16 @@ def run():
         sys.exit(1)
 
     log.info("=" * 50)
-    log.info("Запуск бота")
+    log.info("Запуск бота + API")
     log.info("=" * 50)
+
+    # 1. FastAPI в фоновом потоке
+    threading.Thread(target=_run_api, daemon=True, name="fastapi").start()
+    log.info("[api] FastAPI запущен на http://0.0.0.0:8000")
+
+    # 2. Ждём пока FastAPI поднимется, потом запускаем туннель
+    time.sleep(2)
+    threading.Thread(target=start_tunnel, daemon=True, name="cloudflared").start()
 
     app = (
         ApplicationBuilder()
