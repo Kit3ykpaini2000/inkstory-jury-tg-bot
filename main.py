@@ -236,9 +236,6 @@ def run():
     threading.Thread(target=_run_api, daemon=True, name="fastapi").start()
     log.info("[api] FastAPI запущен на http://0.0.0.0:8000")
 
-    time.sleep(2)
-    threading.Thread(target=lambda: start_tunnel(app), daemon=True, name="tunnel").start()
-
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -246,6 +243,9 @@ def run():
         .post_shutdown(on_shutdown)
         .build()
     )
+
+    time.sleep(2)
+    threading.Thread(target=lambda: start_tunnel(app), daemon=True, name="tunnel").start()
 
     reg_handler = ConversationHandler(
         entry_points=[CommandHandler("register", cmd_register)],
@@ -328,3 +328,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
