@@ -102,7 +102,8 @@ python cli.py
 
 ```
 inkstory-bot/
-├── main.py                    # Точка входа — бот + FastAPI + cloudflared + планировщик
+├── main.py                    # Точка входа — бот + FastAPI + туннель + планировщик
+├── tunnel.py                  # TunnelManager — управление туннелем (cloudflare / xtunnel)
 ├── cli.py                     # Консольное управление: БД, жюри, экспорт
 │
 ├── bot/
@@ -129,7 +130,7 @@ inkstory-bot/
 │   ├── constants.py           # Константы (PostStatus и др.)
 │   ├── database.py            # Подключение к SQLite
 │   ├── config.py              # Все настройки из .env
-│   ├── ai_utils.py            # Проверка текста через Groq
+│   ├── ai_utils.py            # Проверка текста через GitHub Models
 │   ├── word_counter.py        # Подсчёт слов
 │   ├── logger.py              # Логирование
 │   └── db/
@@ -165,6 +166,8 @@ inkstory-bot/
 | `/stats` | Моя статистика |
 | `/fullstats` | Общая статистика конкурса |
 | `/admin` | Панель администратора |
+| `/url` | *(только админ)* Обновить URL Mini App кнопки у всех жюри |
+| `/tunnel` | *(только админ)* Перезапустить туннель и обновить URL |
 
 Также в боте появляется кнопка **«Открыть панель»** — это Telegram Mini App с полным интерфейсом.
 
@@ -213,6 +216,16 @@ http://localhost:8000/api/docs
 ```
 
 ## Changelog
+
+### v3.1
+- **`tunnel.py`** — туннельная логика вынесена в отдельный модуль `TunnelManager`
+  - Retry с kill старого процесса перед каждой попыткой
+  - Универсальный regex URL — работает с любым доменом xtunnel после обновлений
+  - Единая точка управления кнопкой Mini App (больше нет разбросанных `requests.post`)
+- Удалены мёртвые файлы: `bot/handlers/user.py`, `utils/db_helpers.py` (остатки старых веток)
+- `bot/scheduler.py` — убрано дублирование в `job_final_parser`, теперь вызывает `_notify_after_parse()` с параметром prefix
+- `api/routes/admin.py` — убран inline `requests.post` для setChatMenuButton, заменён на `tunnel_manager`
+- Добавлены команды `/url` и `/tunnel` для администраторов
 
 ### v3.0
 - **Telegram Mini App** — полноценный веб-интерфейс вместо команд в чате

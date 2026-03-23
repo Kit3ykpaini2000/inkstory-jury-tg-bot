@@ -158,21 +158,8 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_verified(target_id, 1)
         log.info(f"[admin] Верифицирован {target_id}")
         try:
-            # Обновляем кнопку Mini App для нового жюри
-            from utils.config import BOT_TOKEN
-            import requests as _req
-            _req.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
-                json={
-                    "chat_id": target_id,
-                    "menu_button": {
-                        "type": "web_app",
-                        "text": "Открыть панель",
-                        "web_app": {"url": context.bot_data.get("tunnel_url", "")},
-                    }
-                },
-                timeout=5,
-            )
+            from main import tunnel_manager
+            tunnel_manager.set_menu_button_for(target_id)
         except Exception:
             pass
         try:
@@ -251,3 +238,4 @@ async def got_shutdown_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
     log.info("[admin] Бот остановлен администратором")
     os.kill(os.getpid(), 15)
     return ConversationHandler.END
+
