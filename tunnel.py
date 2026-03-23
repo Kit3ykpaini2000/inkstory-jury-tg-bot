@@ -4,11 +4,18 @@ tunnel.py — управление туннелем (cloudflare / xtunnel)
 Запускает туннель, получает публичный URL и обновляет кнопку Mini App в Telegram.
 Поддерживает повторные попытки и перезапуск без перезапуска всего бота.
 
+Поддерживаемые провайдеры:
+  cloudflare — cloudflared (trycloudflare.com), установка: see README
+  xtunnel    — xtunnel http, установка: see README
+
 Использование:
     from tunnel import TunnelManager
     mgr = TunnelManager(bot_token=BOT_TOKEN, provider="xtunnel")
     url = mgr.start()          # запустить / перезапустить
     mgr.update_menu_button()   # обновить кнопку у всех пользователей
+
+В .env:
+    TUNNEL_PROVIDER=xtunnel   # или cloudflare
 """
 
 import re
@@ -26,8 +33,7 @@ log = setup_logger()
 # Паттерны URL для каждого провайдера
 _URL_PATTERNS = {
     "cloudflare": re.compile(r"https://[\w\-]+\.trycloudflare\.com"),
-    "xtunnel":    re.compile(r"https://[\w\-]+\.[\w\-]+\.[\w]+"),  # универсальный https
-    "serveo":     re.compile(r"https://[\w\-]+\.(?:serveo\.net|serveousercontent\.com)"),
+    "xtunnel":    re.compile(r"https://[\w\-]+\.[\w\-]+\.[\w]+"),
 }
 
 _MENU_BUTTON_TEXT = "Открыть панель"
@@ -50,7 +56,7 @@ class TunnelManager:
         self.timeout     = timeout
         self.retries     = retries
         self.retry_delay = retry_delay
-        self.get_tg_ids  = get_tg_ids  # функция для получения списка tg_id жюри
+        self.get_tg_ids  = get_tg_ids
 
         self.url: str | None = None
         self._proc: subprocess.Popen | None = None
@@ -80,11 +86,7 @@ class TunnelManager:
         self._kill()
         if self.provider == "xtunnel":
             return self._run(["xtunnel", "http", str(self.port)], "stdout")
-        elif self.provider == "serveo":
-            return self._run(["ssh", "-o", "StrictHostKeyChecking=no",
-                               "-R", f"80:localhost:{self.port}",
-                               "serveo.net"], "stdout")
-        else:
+        else:  # cloudflare
             return self._run(
                 ["cloudflared", "tunnel", "--url", f"http://localhost:{self.port}"],
                 "stderr",
@@ -171,10 +173,8 @@ class TunnelManager:
             "web_app": {"url": self.url},
         }
 
-        # Глобальная кнопка (для всех чатов по умолчанию)
         ok = self._set_menu_button(None, menu_button)
 
-        # Персональные кнопки для каждого жюри
         ids = tg_ids or (self.get_tg_ids() if self.get_tg_ids else [])
         for tg_id in ids:
             self._set_menu_button(tg_id, menu_button)
@@ -206,4 +206,3 @@ class TunnelManager:
             "text":    _MENU_BUTTON_TEXT,
             "web_app": {"url": self.url},
         })
-

@@ -197,15 +197,35 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('drawer-overlay').addEventListener('click', hideDrawer);
   document.getElementById('drawer-close').addEventListener('click',   hideDrawer);
 
-  // Проверяем initData с небольшой задержкой — Telegram иногда передаёт его не сразу
-  setTimeout(() => {
-    if (!window.Telegram?.WebApp?.initData) {
-      const banner = document.createElement('div');
-      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#E24B4A;color:#fff;text-align:center;font-size:12px;padding:4px;z-index:999;';
-      banner.textContent = 'Откройте через Telegram для полной работы';
-      document.body.appendChild(banner);
+  // Проверяем initData — Telegram иногда передаёт его с задержкой
+  // Делаем несколько попыток прежде чем показать баннер
+  let bannerShown = false;
+  function checkInitData(attempt) {
+    const tgApp = window.Telegram?.WebApp;
+    if (tgApp?.initData && tgApp.initData.length > 0) {
+      // initData есть — убираем баннер если он был показан
+      if (bannerShown) {
+        const b = document.getElementById('tg-banner');
+        if (b) b.remove();
+        bannerShown = false;
+      }
+      return;
     }
-  }, 1000);
+    if (attempt >= 5) {
+      // 5 попыток не помогли — показываем баннер
+      if (!bannerShown) {
+        const banner = document.createElement('div');
+        banner.id = 'tg-banner';
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#E24B4A;color:#fff;text-align:center;font-size:12px;padding:4px;z-index:999;';
+        banner.textContent = 'Откройте через Telegram для полной работы';
+        document.body.appendChild(banner);
+        bannerShown = true;
+      }
+      return;
+    }
+    setTimeout(() => checkInitData(attempt + 1), 600);
+  }
+  checkInitData(0);
 
   navigateTo('review');
 });

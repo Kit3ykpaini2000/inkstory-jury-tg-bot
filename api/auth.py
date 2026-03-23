@@ -60,8 +60,10 @@ def _verify_init_data(init_data: str) -> dict:
 
 
 def get_current_user(
-    x_telegram_init_data: str = Header(..., alias="X-Telegram-Init-Data")
+    x_telegram_init_data: str = Header(default="", alias="X-Telegram-Init-Data")
 ) -> dict:
+    if not x_telegram_init_data:
+        raise HTTPException(status_code=401, detail="Откройте через Telegram (initData отсутствует)")
     """
     Dependency: извлекает и проверяет пользователя из initData.
     Возвращает dict с полями id, first_name, username и tg_id (str).

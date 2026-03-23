@@ -30,9 +30,18 @@ async function request(method, path, body = null) {
     let detail = `HTTP ${res.status}`;
     try {
       const data = await res.json();
-      detail = data.detail || detail;
+      if (data.detail) {
+        // FastAPI validation errors — это массив объектов [{loc, msg, type}]
+        if (Array.isArray(data.detail)) {
+          detail = data.detail.map(e => e.msg || JSON.stringify(e)).join(', ');
+        } else if (typeof data.detail === 'object') {
+          detail = JSON.stringify(data.detail);
+        } else {
+          detail = String(data.detail);
+        }
+      }
     } catch {}
-    throw new Error(String(detail));
+    throw new Error(detail);
   }
 
   const ct = res.headers.get('content-type') || '';
