@@ -114,11 +114,18 @@ def _start_xtunnel() -> str | None:
             if not line:
                 time.sleep(0.1)
                 continue
+            log.debug(f"[xtunnel] {line.rstrip()}")
             match = re.search(r"https://[\w\-]+\.tunnel4\.com", line)
             if match:
                 url = match.group(0)
                 break
         if url:
+            # Продолжаем читать вывод xtunnel и пишем в лог
+            def _pipe_logs():
+                for line in proc.stdout:
+                    if line.strip():
+                        log.debug(f"[xtunnel] {line.rstrip()}")
+            threading.Thread(target=_pipe_logs, daemon=True, name="xtunnel-logs").start()
             threading.Thread(target=lambda: proc.wait(), daemon=True, name="xtunnel-proc").start()
         else:
             log.warning("[tunnel] xtunnel: не удалось получить URL за 30 сек")

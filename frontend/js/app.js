@@ -32,7 +32,10 @@ let toastTimer = null;
 export function showToast(msg) {
   const el = document.getElementById('toast');
   if (!el) return;
-  el.textContent = String(msg);
+  let text = msg;
+  if (msg instanceof Error) text = msg.message;
+  else if (typeof msg === 'object') text = JSON.stringify(msg);
+  el.textContent = String(text);
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
@@ -194,12 +197,16 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('drawer-overlay').addEventListener('click', hideDrawer);
   document.getElementById('drawer-close').addEventListener('click',   hideDrawer);
 
-  if (!window.Telegram?.WebApp?.initData) {
-    const banner = document.createElement('div');
-    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#E24B4A;color:#fff;text-align:center;font-size:12px;padding:4px;z-index:999;';
-    banner.textContent = 'Откройте через Telegram для полной работы';
-    document.body.appendChild(banner);
-  }
+  // Проверяем initData с небольшой задержкой — Telegram иногда передаёт его не сразу
+  setTimeout(() => {
+    if (!window.Telegram?.WebApp?.initData) {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#E24B4A;color:#fff;text-align:center;font-size:12px;padding:4px;z-index:999;';
+      banner.textContent = 'Откройте через Telegram для полной работы';
+      document.body.appendChild(banner);
+    }
+  }, 1000);
 
   navigateTo('review');
 });
+
