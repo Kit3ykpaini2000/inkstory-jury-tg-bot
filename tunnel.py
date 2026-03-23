@@ -27,6 +27,7 @@ log = setup_logger()
 _URL_PATTERNS = {
     "cloudflare": re.compile(r"https://[\w\-]+\.trycloudflare\.com"),
     "xtunnel":    re.compile(r"https://[\w\-]+\.[\w\-]+\.[\w]+"),  # универсальный https
+    "serveo":     re.compile(r"https://[\w\-]+\.(?:serveo\.net|serveousercontent\.com)"),
 }
 
 _MENU_BUTTON_TEXT = "Открыть панель"
@@ -79,6 +80,10 @@ class TunnelManager:
         self._kill()
         if self.provider == "xtunnel":
             return self._run(["xtunnel", "http", str(self.port)], "stdout")
+        elif self.provider == "serveo":
+            return self._run(["ssh", "-o", "StrictHostKeyChecking=no",
+                               "-R", f"80:localhost:{self.port}",
+                               "serveo.net"], "stdout")
         else:
             return self._run(
                 ["cloudflared", "tunnel", "--url", f"http://localhost:{self.port}"],
@@ -201,3 +206,4 @@ class TunnelManager:
             "text":    _MENU_BUTTON_TEXT,
             "web_app": {"url": self.url},
         })
+
