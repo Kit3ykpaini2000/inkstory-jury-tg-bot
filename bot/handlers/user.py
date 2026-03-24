@@ -1,18 +1,23 @@
 """
-bot/handlers/review.py — флоу проверки поста: /next, /cancel, ввод слов/ошибок,
-                          пропуск, отклонение, AI-проверка
+bot/handlers/user.py — хендлеры для жюри
+
+Команды: /start, /register, /next, /cancel, /stats, /fullstats
 """
 
-from telegram import Update
+import re
+from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import ContextTypes, ConversationHandler
 
-from utils.logger import setup_logger
+from utils.database import get_db
 from utils.config import MAX_WORDS, MAX_ERRORS
-from utils.db.jury import is_registered, is_verified
-from utils.db.posts import save_result, reject_post
-from parser.queue_manager import take_post, get_active_post, release_post, remove_post
-from parser.posts import fetch_post_text
 from utils.ai_utils import check_post
+from utils.logger import setup_logger
+from utils.constants import PostStatus
+from utils.db_helpers import is_registered, is_verified, is_admin
+from parser.queue_manager import (
+    take_post, get_active_post, release_post, remove_post,
+    get_total_queue_count,
+)
 from bot.keyboards import (
     review_keyboard, skip_cancel_keyboard,
     reject_reason_keyboard, reject_custom_cancel_keyboard,
@@ -21,12 +26,226 @@ from bot.keyboards import (
 log = setup_logger()
 
 (
+    WAITING_REG_URL,
     WAITING_WORDS,
     WAITING_ERRORS,
     WAITING_SKIP_TEXT,
     WAITING_REJECT_REASON,
     WAITING_REJECT_CUSTOM,
-) = range(1, 6)
+) = range(6)
+
+
+# ── Хелперы БД ────────────────────────────────────────────────────────────────
+
+def _register(tg_id: str, name: str, url: str) -> None:
+    with get_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO reviewers (TGID, URL, Name, IsAdmin, Verified) VALUES (?,?,?,0,0)",
+            (tg_id, url, name),
+        )
+        db.commit()
+
+
+def _skip_post(post_id: int, tgid: str, reason: str) -> None:
+    """Освобождает пост с причиной пропуска."""
+    release_post(tgid, post_id)
+    log.info(f"[skip] {tgid} → #{post_id}: {reason}")
+
+
+def _reject_post(post_id: int, tgid: str, reason: str) -> bool:
+    """Отклоняет пост — меняет статус и сохраняет причину."""
+    with get_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        row = db.execute(
+            "SELECT Post FROM queue WHERE Post=? AND Reviewer=? AND TakenAt IS NOT NULL",
+            (post_id, tgid),
+        ).fetchone()
+
+        if not row:
+            db.execute("ROLLBACK")
+            return False
+
+        db.execute(
+            "UPDATE posts_info SET Status=? WHERE ID=?",
+            (PostStatus.REJECTED, post_id),
+        )
+        db.execute(
+            "UPDATE results SET RejectReason=?, Reviewer=? WHERE Post=?",
+            (reason, tgid, post_id),
+        )
+        db.execute("COMMIT")
+
+    remove_post(post_id)
+    log.info(f"[reject] {tgid} → #{post_id}: {reason}")
+    return True
+
+
+def _save_result(post_id: int, tgid: str, words: int, errors: int) -> bool:
+    """Сохраняет результат проверки."""
+    with get_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        row = db.execute(
+            "SELECT Post FROM queue WHERE Post=? AND Reviewer=? AND TakenAt IS NOT NULL",
+            (post_id, tgid),
+        ).fetchone()
+
+        if not row:
+            db.execute("ROLLBACK")
+            return False
+
+        db.execute(
+            "UPDATE results SET HumanWords=?, HumanErrors=?, Reviewer=? WHERE Post=?",
+            (words, errors, tgid, post_id),
+        )
+        db.execute(
+            "UPDATE posts_info SET Status=? WHERE ID=?",
+            (PostStatus.DONE, post_id),
+        )
+        db.execute("COMMIT")
+
+    remove_post(post_id)
+    log.info(f"[check] {tgid} → #{post_id}: слов={words}, ошибок={errors}")
+    return True
+
+
+def _get_my_stats(tg_id: str) -> dict | None:
+    with get_db() as db:
+        row = db.execute(
+            """
+            SELECT
+                rv.Name,
+                COUNT(CASE WHEN r.HumanWords IS NOT NULL THEN 1 END) AS checked,
+                COUNT(CASE WHEN p.Status=? AND r.Reviewer=rv.TGID THEN 1 END) AS rejected,
+                COALESCE(SUM(r.HumanWords),  0) AS total_words,
+                COALESCE(SUM(r.HumanErrors), 0) AS total_errors
+            FROM reviewers rv
+            LEFT JOIN results    r ON r.Reviewer = rv.TGID
+            LEFT JOIN posts_info p ON p.ID = r.Post
+            WHERE rv.TGID = ?
+            GROUP BY rv.TGID
+            """,
+            (PostStatus.REJECTED, tg_id),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "name":         row["Name"],
+        "checked":      row["checked"],
+        "rejected":     row["rejected"],
+        "total_words":  row["total_words"],
+        "total_errors": row["total_errors"],
+    }
+
+
+# ── Команды ───────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    await update.message.reply_text("👋 Привет!", reply_markup=ReplyKeyboardRemove())
+
+    if not is_registered(tg_id):
+        await update.message.reply_text("Для регистрации используй /register")
+        return
+
+    if not is_verified(tg_id):
+        await update.message.reply_text(
+            "Ты зарегистрирован ✅\n"
+            "⏳ Ожидаешь верификации от администратора.\n\n"
+            "/stats — моя статистика"
+        )
+        return
+
+    commands = (
+        "Ты зарегистрирован и верифицирован ✅\n\n"
+        "/next — получить пост\n"
+        "/stats — моя статистика\n"
+        "/fullstats — общая статистика"
+    )
+    if is_admin(tg_id):
+        commands += "\n/admin — панель администратора"
+    await update.message.reply_text(commands)
+
+
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if is_registered(tg_id):
+        await update.message.reply_text("Ты уже зарегистрирован ✅")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Отправь ссылку на свой профиль на inkstory.net\n"
+        "Формат: https://inkstory.net/user/username"
+    )
+    return WAITING_REG_URL
+
+
+async def got_reg_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    name  = update.effective_user.username or update.effective_user.first_name
+    url   = update.message.text.strip().rstrip("/")
+
+    if not re.match(r"https://inkstory\.net/user/[\w\-]+$", url):
+        await update.message.reply_text(
+            "⚠️ Неверная ссылка. Нужен формат: https://inkstory.net/user/username"
+        )
+        return WAITING_REG_URL
+
+    _register(tg_id, name, url)
+    log.info(f"[register] {name} ({tg_id}) → {url}")
+    await update.message.reply_text(
+        "✅ Зарегистрирован!\n\n"
+        "⏳ Дождись верификации от администратора.\n\n"
+        "/stats — моя статистика"
+    )
+    return ConversationHandler.END
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not is_registered(tg_id):
+        await update.message.reply_text("Сначала зарегистрируйся через /register")
+        return
+
+    data = _get_my_stats(tg_id)
+    if not data:
+        await update.message.reply_text("Не удалось получить статистику.")
+        return
+
+    ep1k = (
+        round(data["total_errors"] / data["total_words"] * 1000, 2)
+        if data["total_words"] else 0
+    )
+    await update.message.reply_text(
+        f"📊 Твоя статистика, {data['name']}:\n\n"
+        f"✅ Проверено: {data['checked']}\n"
+        f"❌ Отклонено: {data['rejected']}\n"
+        f"📝 Всего слов: {data['total_words']}\n"
+        f"📉 Ошибок на 1000 слов: {ep1k}"
+    )
+
+
+async def cmd_fullstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = str(update.effective_user.id)
+    if not is_registered(tg_id):
+        await update.message.reply_text("Сначала зарегистрируйся через /register")
+        return
+
+    with get_db() as db:
+        checked  = db.execute(
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.DONE,)
+        ).fetchone()[0]
+        rejected = db.execute(
+            "SELECT COUNT(*) FROM posts_info WHERE Status=?", (PostStatus.REJECTED,)
+        ).fetchone()[0]
+
+    await update.message.reply_text(
+        f"📊 Общая статистика:\n\n"
+        f"📋 В очереди: {get_total_queue_count()}\n"
+        f"✅ Проверено: {checked}\n"
+        f"❌ Отклонено: {rejected}"
+    )
 
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,10 +310,8 @@ async def got_errors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка сессии. Попробуй /next снова.")
         return ConversationHandler.END
 
-    success = save_result(post["post_id"], tg_id, words, int(text))
+    success = _save_result(post["post_id"], tg_id, words, int(text))
     if success:
-        remove_post(post["post_id"])
-        log.info(f"[check] {tg_id} → #{post['post_id']}: слов={words}, ошибок={text}")
         await update.message.reply_text("✅ Сохранено! /next — следующий пост")
     else:
         await update.message.reply_text("⚠️ Не удалось сохранить. Попробуй /next.")
@@ -128,16 +345,18 @@ async def cb_ai_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Нет активного поста. Попробуй /next.")
         return WAITING_WORDS
 
-    await query.message.reply_text("🤖 Загружаю текст поста, подожди...")
+    with get_db() as db:
+        row = db.execute(
+            "SELECT Text FROM posts_info WHERE ID=?", (post["post_id"],)
+        ).fetchone()
 
-    text = fetch_post_text(post["url"])
-    if not text:
-        await query.message.reply_text("⚠️ Не удалось загрузить текст поста.")
+    if not row or not row["Text"]:
+        await query.message.reply_text("⚠️ Текст поста не найден.")
         return WAITING_WORDS
 
-    await query.message.reply_text("🤖 Отправляю текст на проверку...")
+    await query.message.reply_text("🤖 Отправляю текст на проверку, подожди...")
 
-    for msg in check_post(text):
+    for msg in check_post(row["Text"]):
         for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
             await query.message.reply_text(chunk)
 
@@ -184,8 +403,7 @@ async def got_skip_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_SKIP_TEXT
 
-    release_post(tg_id, post["post_id"])
-    log.info(f"[skip] {tg_id} → #{post['post_id']}: {reason}")
+    _skip_post(post["post_id"], tg_id, reason)
     await update.message.reply_text(
         f"⏭️ Пропущено (причина: {reason}).\n"
         f"Пост вернулся в очередь.\n\n/next — следующий пост"
@@ -238,9 +456,7 @@ async def cb_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     reason = reason_map.get(query.data, query.data)
 
-    if reject_post(post["post_id"], tg_id, reason):
-        remove_post(post["post_id"])
-        log.info(f"[reject] {tg_id} → #{post['post_id']}: {reason}")
+    if _reject_post(post["post_id"], tg_id, reason):
         await query.message.reply_text("❌ Пост отклонён.\n\n/next — следующий пост")
     else:
         await query.message.reply_text("⚠️ Не удалось отклонить. Попробуй /next.")
@@ -266,9 +482,7 @@ async def got_reject_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_REJECT_CUSTOM
 
     full_reason = f"other: {reason}"
-    if reject_post(post["post_id"], tg_id, full_reason):
-        remove_post(post["post_id"])
-        log.info(f"[reject] {tg_id} → #{post['post_id']}: {full_reason}")
+    if _reject_post(post["post_id"], tg_id, full_reason):
         await update.message.reply_text(
             f"❌ Пост отклонён (причина: {reason}).\n\n/next — следующий пост"
         )

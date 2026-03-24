@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from utils.database import get_db
 from utils.logger import setup_logger
-from utils.db.jury import get_all_verified_ids
+from utils.db_helpers import get_all_verified_ids
 from parser.queue_manager import (
     assign_post, release_expired_posts, get_free_posts_count,
 )
@@ -61,7 +61,7 @@ async def _run_parser() -> list[int] | None:
             return None
 
 
-async def _notify_after_parse(bot, post_ids: list[int], prefix: str = "Появились новые посты!") -> None:
+async def _notify_after_parse(bot, post_ids: list[int]) -> None:
     """
     Назначает посты в очередь и уведомляет жюри.
 
@@ -83,7 +83,7 @@ async def _notify_after_parse(bot, post_ids: list[int], prefix: str = "Появ�
             await bot.send_message(
                 chat_id=tg_id,
                 text=(
-                    f"📬 {prefix}\n\n"
+                    f"📬 Появились новые посты!\n\n"
                     f"🆕 Тебе добавлено: {count}\n\n"
                     f"/next — взять пост"
                 ),
@@ -97,7 +97,7 @@ async def _notify_after_parse(bot, post_ids: list[int], prefix: str = "Появ�
                 await bot.send_message(
                     chat_id=tg_id,
                     text=(
-                        f"📬 {prefix}\n\n"
+                        f"📬 Появились новые посты!\n\n"
                         f"🆕 Новых в очереди: {open_count}\n\n"
                         f"/next — взять пост"
                     ),
@@ -121,7 +121,42 @@ async def job_final_parser(context):
     post_ids = await _run_parser()
     if post_ids is None:
         return
-    await _notify_after_parse(context.bot, post_ids, prefix="Финальный сбор постов дня!")
+
+    assigned: dict[str, int] = {}
+    open_count = 0
+    for post_id in post_ids:
+        tgid = assign_post(post_id)
+        if tgid:
+            assigned[tgid] = assigned.get(tgid, 0) + 1
+        else:
+            open_count += 1
+
+    for tg_id, count in assigned.items():
+        try:
+            await context.bot.send_message(
+                chat_id=tg_id,
+                text=(
+                    f"📬 Финальный сбор постов дня!\n\n"
+                    f"🆕 Тебе добавлено: {count}\n\n"
+                    f"/next — взять пост"
+                ),
+            )
+        except Exception as e:
+            log.warning(f"[scheduler] Не удалось уведомить {tg_id}: {e}")
+
+    if open_count > 0:
+        for tg_id in get_all_verified_ids():
+            try:
+                await context.bot.send_message(
+                    chat_id=tg_id,
+                    text=(
+                        f"📬 Финальный сбор постов дня!\n\n"
+                        f"🆕 Новых в очереди: {open_count}\n\n"
+                        f"/next — взять пост"
+                    ),
+                )
+            except Exception as e:
+                log.warning(f"[scheduler] Не удалось уведомить {tg_id}: {e}")
 
 
 async def job_new_day(context):
@@ -182,4 +217,3 @@ async def job_check_expired(context):
                 )
             except Exception as e:
                 log.warning(f"[expired] Не удалось уведомить {tgid}: {e}")
-
